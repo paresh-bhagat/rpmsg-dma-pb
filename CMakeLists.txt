@@ -10,6 +10,7 @@ option(BUILD_LIB "Build the rpmsg_dma library" ON)
 option(BUILD_AUDIO_OFFLOAD_EXAMPLE "Build the audio_offload example" ON)
 option(BUILD_2DFFT_OFFLOAD_EXAMPLE "Build the 2dfft_offload example" ON)
 option(BUILD_SIGNAL_CHAIN_BIQUAD_EXAMPLE "Build the sigchain_biquad example" ON)
+option(BUILD_EDGE_AI_EXAMPLE "Build the edge-ai dual task example" ON)
 
 # Global include path
 include_directories(${CMAKE_SOURCE_DIR}/library/include)
@@ -29,4 +30,8 @@ endif()
 
 if(BUILD_SIGNAL_CHAIN_BIQUAD_EXAMPLE)
 	add_subdirectory(example/sigchain_biquad)
+endif()
+
+if(BUILD_EDGE_AI_EXAMPLE)
+	add_subdirectory(example/edge-ai)
 endif()
