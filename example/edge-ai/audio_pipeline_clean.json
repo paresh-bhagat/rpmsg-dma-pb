@@ -1,0 +1,32 @@
+{
+  "pipeline_id": "audio_stft_pipeline",
+  "description": "Clean 3-stage audio pipeline: STFT analyze -> TVM inference -> ISTFT synthesize",
+  "stages": [
+    {
+      "stage_id": "stft_analysis",
+      "service": "generic",
+      "message_type": "C7X_MSG_STFT_ANALYZE",
+      "parameters": {
+        "input_size": "1024",
+        "graph_id": "0"
+      }
+    },
+    {
+      "stage_id": "tvm_inference",
+      "service": "tvm",
+      "message_type": "TVM_INFERENCE",
+      "parameters": {
+        "input_size": "1028"
+      }
+    },
+    {
+      "stage_id": "stft_synthesis",
+      "service": "generic",
+      "message_type": "C7X_MSG_ISTFT_SYNTHESIZE",
+      "parameters": {
+        "input_size": "1028",
+        "graph_id": "0"
+      }
+    }
+  ]
+}

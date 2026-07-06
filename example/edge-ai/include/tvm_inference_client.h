@@ -41,11 +41,14 @@ public:
 
     // Inference
     bool run_inference_benchmark(int num_iterations = 10);
+    bool run_inference_with_data(const void* input_data, size_t input_size);
+    bool run_inference_with_npz(const std::string& npz_path);
     void print_top5_results();
 
     // Status
     bool is_initialized() const { return initialized_; }
     const std::vector<float>& get_output() const { return output_data_; }
+    const std::vector<int>& get_input_shape() const { return input_shape_; }
 
 private:
     // Helper methods

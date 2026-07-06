@@ -1,0 +1,24 @@
+{
+  "pipeline_id": "audio_stft_istft",
+  "description": "STFT round-trip pipeline: STFT analyze -> ISTFT synthesize (no TVM)",
+  "stages": [
+    {
+      "stage_id": "stft_analysis",
+      "service": "generic",
+      "message_type": "C7X_MSG_STFT_ANALYZE",
+      "parameters": {
+        "input_size": "1024",
+        "graph_id": "0"
+      }
+    },
+    {
+      "stage_id": "stft_synthesis",
+      "service": "generic",
+      "message_type": "C7X_MSG_ISTFT_SYNTHESIZE",
+      "parameters": {
+        "input_size": "1028",
+        "graph_id": "0"
+      }
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 # Replicates functionality of inference.py using C++ and TVM runtime
 
 cmake_minimum_required(VERSION 3.10)
-project(tvm_inference_client)
+project(rpmsg_inference_example)
 
 # Enable C++ support
 enable_language(CXX)
@@ -23,18 +23,20 @@ endif()
 
 message(STATUS "Using TVM_ROOT: ${TVM_ROOT}")
 
-# Source files (TVM runtime approach)
+# Source files (Interactive Pipeline Application)
 set(EDGE_AI_SOURCES
     src/main.cpp
     src/tvm_inference_client.cpp
+    src/generic_task_client.cpp
+    src/pipeline_manager.cpp
 )
 
 # Create the executable
-add_executable(tvm_inference_client ${EDGE_AI_SOURCES})
+add_executable(rpmsg_inference_example ${EDGE_AI_SOURCES})
 
 # Include directories
-target_include_directories(tvm_inference_client PRIVATE
-    src
+target_include_directories(rpmsg_inference_example PRIVATE
+    include
     ${TVM_ROOT}/include
     ${TVM_ROOT}/3rdparty/dlpack/include
     ${TVM_ROOT}/3rdparty/dmlc-core/include
@@ -42,7 +44,7 @@ target_include_directories(tvm_inference_client PRIVATE
 )
 
 # Preprocessor definitions
-target_compile_definitions(tvm_inference_client PRIVATE
+target_compile_definitions(rpmsg_inference_example PRIVATE
     DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>
 )
 
@@ -60,13 +62,42 @@ endif()
 
 message(STATUS "Using TVM runtime: ${TVM_RUNTIME_LIB}")
 
+# Find json-c library for JSON pipeline configuration
+find_library(JSON_C_LIB json-c REQUIRED)
+find_path(JSON_C_INCLUDE_DIR json-c/json.h
+    PATHS /usr/include /usr/local/include
+    REQUIRED)
+
+# Add json-c include directory
+target_include_directories(rpmsg_inference_example PRIVATE ${JSON_C_INCLUDE_DIR})
+
+# Add cnpy for NPZ loading
+set(CNPY_DIR "${TVM_ROOT}/3rdparty/cnpy")
+include_directories(${CNPY_DIR})
+add_library(cnpy STATIC ${CNPY_DIR}/cnpy.cpp)
+target_include_directories(cnpy PRIVATE ${CNPY_DIR})
+target_include_directories(rpmsg_inference_example PRIVATE ${CNPY_DIR})
+
+# Find readline library for interactive mode with command line editing
+find_library(READLINE_LIB readline REQUIRED)
+
+# Find audio libraries for WAV file processing and playback
+find_library(SNDFILE_LIB sndfile REQUIRED)
+find_library(ALSA_LIB asound REQUIRED)
+
 # Link with required libraries
-target_link_libraries(tvm_inference_client
+target_link_libraries(rpmsg_inference_example
     ${TVM_RUNTIME_LIB}
     ti_rpmsg_dma
+    ${JSON_C_LIB}
+    ${READLINE_LIB}
+    ${SNDFILE_LIB}
+    ${ALSA_LIB}
+    cnpy
+    z
     pthread
     dl
 )
 
 # Install target
-install(TARGETS tvm_inference_client DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS rpmsg_inference_example DESTINATION ${CMAKE_INSTALL_BINDIR})

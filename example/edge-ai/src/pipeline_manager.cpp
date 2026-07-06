@@ -1,319 +1,1215 @@
 #include "pipeline_manager.h"
 #include <iostream>
+#include <sstream>
 #include <fstream>
-#include <chrono>
-#include <cstring>
+#include <filesystem>
+#include <cstdlib>
+#include <iomanip>
 #include <algorithm>
 #include <cmath>
-#include <thread>
-#include <iomanip>
+#include <chrono>
+#include <set>
+#include <cstring>
+#include <cnpy.h>
+#include <sndfile.h>
+#include <alsa/asoundlib.h>
+
+extern "C" {
+#include "fw_loader.h"
+#include <readline/readline.h>
+#include <readline/history.h>
+}
+
+// TVM Fixed Memory Addresses (hardcoded - no JSON)
+#define TVM_INPUT_ADDR     0xa3000000UL   // STFT output → TVM input
+#define TVM_OUTPUT_ADDR    0xabc00000UL   // TVM output → ISTFT input
+
 
 PipelineManager::PipelineManager()
     : initialized_(false)
 {
-    // Default configuration - all stages enabled
-    config_.pre_process = {true, 1, 602112, 602112};      // MobileNet float32 tensor size
-    config_.tvm_inference = {true, 2, 602112, 4000};      // Input tensor → classification output
-    config_.post_process = {true, 3, 4000, 4000};         // Classification results processing
+    state_.artifacts_loaded = false;
+    state_.tvm_artifacts_configured = false;
+    state_.input_configured = false;
+    state_.current_pipeline_file = "";
+    state_.current_input_file = "";
+    state_.tvm_staging_buffer = nullptr;
+    state_.tvm_result_buffer = nullptr;
+    state_.staging_buffer_size = 0;
+    state_.result_buffer_size = 0;
+
+
+    extern char* __progname;
+    app_name_ = std::string(__progname);
 }
 
 PipelineManager::~PipelineManager()
 {
-    // Cleanup handled by smart pointers
 }
 
-bool PipelineManager::initialize(std::shared_ptr<TvmInferenceClient> tvm_client)
+bool PipelineManager::initialize()
 {
-    if (!tvm_client) {
-        std::cerr << "[Pipeline] Error: TVM client is null" << std::endl;
-        return false;
-    }
-
-    tvm_client_ = tvm_client;
-
-
-    // Initialize Generic Task client
+    tvm_client_ = std::make_shared<TvmInferenceClient>();
     generic_client_ = std::make_unique<GenericTaskClient>();
-    if (!generic_client_->initialize(config_.pre_process.input_buffer_size,
-                                    config_.post_process.output_buffer_size)) {
-        std::cerr << "[Pipeline] Failed to initialize Generic Task client" << std::endl;
-        return false;
-    }
 
-    std::cout << "[Pipeline] Pipeline initialized successfully" << std::endl;
+    // TVM client will be initialized later when pipeline is loaded (needs artifacts path from config)
+
+    initializeCommands();
     initialized_ = true;
     return true;
 }
 
-bool PipelineManager::configure(const PipelineConfig& config)
+int PipelineManager::run()
 {
-    config_ = config;
+    if (!initialize()) {
+        std::cout << "[App] Failed to initialize application" << std::endl;
+        return 1;
+    }
 
-    if (!validate_configuration()) {
-        std::cerr << "[Pipeline] Invalid pipeline configuration" << std::endl;
+    printWelcome();
+
+    char* input_line = nullptr;
+    while (true) {
+        std::string prompt = getCurrentPrompt();
+        input_line = readline(prompt.c_str());
+
+        if (!input_line) {
+            std::cout << std::endl << "[App] EOF received, exiting..." << std::endl;
+            break;
+        }
+
+        std::string line(input_line);
+
+        if (!line.empty() && line.find_first_not_of(" \t") != std::string::npos) {
+            add_history(input_line);
+        }
+
+        free(input_line);
+
+        if (line.empty() || line.find_first_not_of(" \t") == std::string::npos) {
+            continue;
+        }
+
+        auto tokens = parseCommand(line);
+        if (tokens.empty()) {
+            continue;
+        }
+
+        CommandResult result = executeCommand(tokens);
+        if (result == CommandResult::QUIT) {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+void PipelineManager::initializeCommands()
+{
+    registerCommand("help", "Show available commands",
+                   {"help"},
+                   std::bind(&PipelineManager::handleHelp, this, std::placeholders::_1));
+
+    registerCommand("pipeline", "Load pipeline configuration from JSON file",
+                   {"pipeline <file.json>", "pipeline sample.json"},
+                   std::bind(&PipelineManager::handlePipeline, this, std::placeholders::_1));
+
+    registerCommand("tvm_artifacts", "Configure TVM model artifacts",
+                   {"tvm_artifacts <file1.so> [file2.so] ...", "tvm_artifacts model.so"},
+                   std::bind(&PipelineManager::handleTvmArtifacts, this, std::placeholders::_1));
+
+    registerCommand("input", "Set input data for pipeline execution",
+                   {"input <file>", "input sample.wav"},
+                   std::bind(&PipelineManager::handleInput, this, std::placeholders::_1));
+
+    registerCommand("show_pipeline", "Display current pipeline structure",
+                   {"show_pipeline"},
+                   std::bind(&PipelineManager::handleShowPipeline, this, std::placeholders::_1));
+
+    registerCommand("run", "Execute pipeline (loads input and artifacts as needed)",
+                   {"run"},
+                   std::bind(&PipelineManager::handleRun, this, std::placeholders::_1));
+
+    registerCommand("status", "Show current application state",
+                   {"status"},
+                   std::bind(&PipelineManager::handleStatus, this, std::placeholders::_1));
+
+    registerCommand("quit", "Exit the application",
+                   {"quit", "exit"},
+                   std::bind(&PipelineManager::handleQuit, this, std::placeholders::_1));
+}
+
+void PipelineManager::printWelcome()
+{
+    std::cout << "\n===========================================\n";
+    std::cout << "       RPMsg Inference Example\n";
+    std::cout << "===========================================\n";
+    std::cout << "Type 'help' for available commands\n" << std::endl;
+}
+
+void PipelineManager::printPrompt()
+{
+    std::cout << getCurrentPrompt();
+}
+
+std::vector<std::string> PipelineManager::parseCommand(const std::string& input)
+{
+    std::vector<std::string> tokens;
+    std::istringstream iss(input);
+    std::string token;
+
+    while (iss >> token) {
+        tokens.push_back(token);
+    }
+
+    return tokens;
+}
+
+PipelineManager::CommandResult PipelineManager::executeCommand(const std::vector<std::string>& tokens)
+{
+    if (tokens.empty()) {
+        return CommandResult::SUCCESS;
+    }
+
+    std::string command = tokens[0];
+    std::vector<std::string> args(tokens.begin() + 1, tokens.end());
+
+    if (command == "exit") {
+        command = "quit";
+    }
+
+    auto it = commands_.find(command);
+    if (it != commands_.end()) {
+        return it->second.handler(args);
+    } else {
+        std::cout << "[App] Unknown command: " << command << std::endl;
+        std::cout << "[App] Type 'help' for available commands" << std::endl;
+        return CommandResult::ERROR;
+    }
+}
+
+PipelineManager::CommandResult PipelineManager::handleHelp(const std::vector<std::string>& args)
+{
+    std::cout << "\nAvailable commands:\n";
+    std::cout << "===================\n";
+
+    for (const auto& [name, info] : commands_) {
+        std::cout << name << " - " << info.description << "\n";
+        std::cout << "Examples: ";
+        for (size_t i = 0; i < info.examples.size(); ++i) {
+            std::cout << info.examples[i];
+            if (i < info.examples.size() - 1) std::cout << ", ";
+        }
+        std::cout << "\n\n";
+    }
+
+    return CommandResult::SUCCESS;
+}
+
+PipelineManager::CommandResult PipelineManager::handlePipeline(const std::vector<std::string>& args)
+{
+    if (args.empty()) {
+        std::cout << "[App] Error: Pipeline file required" << std::endl;
+        std::cout << "Usage: pipeline <file.json>" << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    std::string pipeline_file = args[0];
+
+    std::ifstream file(pipeline_file);
+    if (!file.is_open()) {
+        std::cout << "[App] Error: Pipeline file not found: " << pipeline_file << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    std::string json_content((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+    file.close();
+
+    json_object* root = json_tokener_parse(json_content.c_str());
+    if (!root) {
+        std::cout << "[App] Error: Invalid JSON format" << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    state_.pipeline_config = PipelineConfig();
+
+    json_object* pipeline_id_obj;
+    if (json_object_object_get_ex(root, "pipeline_id", &pipeline_id_obj)) {
+        state_.pipeline_config.pipeline_id = json_object_get_string(pipeline_id_obj);
+    }
+
+    json_object* description_obj;
+    if (json_object_object_get_ex(root, "description", &description_obj)) {
+        state_.pipeline_config.description = json_object_get_string(description_obj);
+    }
+
+    json_object* stages_obj;
+    if (json_object_object_get_ex(root, "stages", &stages_obj)) {
+        int stages_len = json_object_array_length(stages_obj);
+        state_.pipeline_config.stages.clear();
+
+        for (int i = 0; i < stages_len; i++) {
+            json_object* stage_obj = json_object_array_get_idx(stages_obj, i);
+            PipelineStage stage;
+
+            json_object* stage_id_obj;
+            if (json_object_object_get_ex(stage_obj, "stage_id", &stage_id_obj)) {
+                stage.stage_id = json_object_get_string(stage_id_obj);
+            }
+
+            json_object* service_obj;
+            if (json_object_object_get_ex(stage_obj, "service", &service_obj)) {
+                stage.service = json_object_get_string(service_obj);
+            }
+
+            json_object* message_type_obj;
+            if (json_object_object_get_ex(stage_obj, "message_type", &message_type_obj)) {
+                stage.message_type = json_object_get_string(message_type_obj);
+            }
+
+            // Note: input_addr and output_addr removed - using hardcoded TVM addresses
+
+            json_object* parameters_obj;
+            if (json_object_object_get_ex(stage_obj, "parameters", &parameters_obj)) {
+                json_object_object_foreach(parameters_obj, key, val) {
+                    stage.parameters[key] = json_object_get_string(val);
+                }
+            }
+
+            state_.pipeline_config.stages.push_back(stage);
+        }
+    }
+
+    json_object_put(root);
+
+    state_.pipeline_config.loaded = true;
+    state_.current_pipeline_file = pipeline_file;
+
+    std::cout << "[App] Pipeline configuration loaded: " << state_.pipeline_config.pipeline_id << std::endl;
+    std::cout << "[App] Description: " << state_.pipeline_config.description << std::endl;
+    std::cout << "[App] Stages: " << state_.pipeline_config.stages.size() << std::endl;
+
+    return CommandResult::SUCCESS;
+}
+
+PipelineManager::CommandResult PipelineManager::handleTvmArtifacts(const std::vector<std::string>& args)
+{
+    if (args.empty()) {
+        std::cout << "[App] Error: At least one artifact file/directory required" << std::endl;
+        std::cout << "Usage: tvm_artifacts <file1.so> [file2.so] ..." << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    state_.tvm_artifacts_paths.clear();
+
+    for (const std::string& artifact : args) {
+        if (!std::filesystem::exists(artifact)) {
+            std::cout << "[App] Error: Artifact not found: " << artifact << std::endl;
+            return CommandResult::ERROR;
+        }
+        state_.tvm_artifacts_paths.push_back(artifact);
+    }
+
+    state_.tvm_artifacts_configured = true;
+
+    std::cout << "[App] TVM artifacts configured (" << args.size() << " files):" << std::endl;
+    for (const std::string& artifact : state_.tvm_artifacts_paths) {
+        std::cout << "[App]   " << artifact << std::endl;
+    }
+
+    std::cout << "[App] TVM artifacts path set (will be used when TVM stage is enabled)" << std::endl;
+    return CommandResult::SUCCESS;
+}
+
+PipelineManager::CommandResult PipelineManager::handleInput(const std::vector<std::string>& args)
+{
+    if (args.empty()) {
+        std::cout << "[App] Error: Input file required" << std::endl;
+        std::cout << "Usage: input <file>" << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    std::string input_file = args[0];
+
+    std::ifstream file(input_file);
+    if (!file.is_open()) {
+        std::cout << "[App] Error: Input file not found: " << input_file << std::endl;
+        return CommandResult::ERROR;
+    }
+    file.close();
+
+    // Detect input type by extension
+    if (input_file.size() >= 4 && input_file.substr(input_file.size() - 4) == ".wav") {
+        state_.input_type = InputType::AUDIO_WAV;
+    } else if (input_file.size() >= 4 && input_file.substr(input_file.size() - 4) == ".npz") {
+        state_.input_type = InputType::TENSOR_NPZ;
+    } else {
+        std::cout << "[App] Warning: Unknown input type for file: " << input_file << std::endl;
+        state_.input_type = InputType::UNKNOWN;
+    }
+
+    state_.current_input_file = input_file;
+    state_.input_configured = true;
+
+    std::string type_str;
+    switch (state_.input_type) {
+        case InputType::AUDIO_WAV: type_str = "WAV audio"; break;
+        case InputType::TENSOR_NPZ: type_str = "NPZ tensor"; break;
+        default: type_str = "unknown"; break;
+    }
+
+    std::cout << "[App] Input configured: " << input_file << " (type: " << type_str << ")" << std::endl;
+
+    return CommandResult::SUCCESS;
+}
+
+PipelineManager::CommandResult PipelineManager::handleShowPipeline(const std::vector<std::string>& args)
+{
+    if (!state_.pipeline_config.loaded) {
+        std::cout << "[App] No pipeline configuration loaded" << std::endl;
+        std::cout << "Use 'pipeline <file.json>' to load a pipeline configuration" << std::endl;
+        return CommandResult::SUCCESS;
+    }
+
+    std::cout << std::endl << "Pipeline Configuration:" << std::endl;
+    std::cout << "======================" << std::endl;
+    std::cout << "Pipeline ID: " << state_.pipeline_config.pipeline_id << std::endl;
+    std::cout << "Description: " << state_.pipeline_config.description << std::endl;
+    std::cout << "Source File: " << state_.current_pipeline_file << std::endl;
+    std::cout << std::endl << "Stages (" << state_.pipeline_config.stages.size() << "):" << std::endl;
+
+    for (size_t i = 0; i < state_.pipeline_config.stages.size(); i++) {
+        const auto& stage = state_.pipeline_config.stages[i];
+        std::cout << std::endl << "  [" << (i + 1) << "] " << stage.stage_id << " (" << stage.service << " service)" << std::endl;
+        std::cout << "      Message Type: " << stage.message_type << std::endl;
+
+        if (!stage.parameters.empty()) {
+            std::cout << "      Parameters:" << std::endl;
+            for (const auto& [key, value] : stage.parameters) {
+                std::cout << "        " << key << ": " << value << std::endl;
+            }
+        }
+    }
+
+    return CommandResult::SUCCESS;
+}
+
+PipelineManager::CommandResult PipelineManager::handleRun(const std::vector<std::string>& args)
+{
+    if (!validateConfiguration()) {
+        return CommandResult::ERROR;
+    }
+
+    std::cout << "[App] Executing sequential pipeline: " << state_.pipeline_config.pipeline_id << std::endl;
+    std::cout << "[App] Stages: " << state_.pipeline_config.stages.size() << std::endl;
+
+    return executeSequentialPipeline();
+}
+
+PipelineManager::CommandResult PipelineManager::handleStatus(const std::vector<std::string>& args)
+{
+    std::cout << std::endl << "System Status:" << std::endl;
+    std::cout << "==============" << std::endl;
+    std::cout << "Application: " << (initialized_ ? "Initialized" : "Not Initialized") << std::endl;
+
+    if (state_.pipeline_config.loaded) {
+        std::cout << std::endl << "Pipeline Configuration:" << std::endl;
+        std::cout << "======================" << std::endl;
+        std::cout << "Pipeline ID: " << state_.pipeline_config.pipeline_id << std::endl;
+        std::cout << "Description: " << state_.pipeline_config.description << std::endl;
+        std::cout << "Source File: " << state_.current_pipeline_file << std::endl;
+        std::cout << "  [1] " << state_.pipeline_config.stages[0].stage_id << " (" << state_.pipeline_config.stages[0].service << ")" << std::endl;
+        std::cout << "  [2] " << state_.pipeline_config.stages[1].stage_id << " (" << state_.pipeline_config.stages[1].service << ")" << std::endl;
+        std::cout << "  [3] " << state_.pipeline_config.stages[2].stage_id << " (" << state_.pipeline_config.stages[2].service << ")" << std::endl;
+    } else {
+        std::cout << "Pipeline Configuration: Not loaded" << std::endl;
+    }
+
+    std::cout << std::endl << "Configuration Status:" << std::endl;
+    std::cout << "=====================" << std::endl;
+    std::cout << "TVM Artifacts: " << (state_.tvm_artifacts_configured ? "Configured" : "Not configured") << std::endl;
+    if (state_.tvm_artifacts_configured) {
+        std::cout << "  Files: " << state_.tvm_artifacts_paths.size() << std::endl;
+    }
+    std::cout << "Input Data: " << (state_.input_configured ? "Configured" : "Not configured") << std::endl;
+    if (state_.input_configured) {
+        std::cout << "  File: " << state_.current_input_file << std::endl;
+    }
+    std::cout << "Artifacts Loaded: " << (state_.artifacts_loaded ? "Yes" : "No") << std::endl;
+
+    std::cout << std::endl << "Readiness Check:" << std::endl;
+    std::cout << "================" << std::endl;
+    bool ready = state_.pipeline_config.loaded && state_.tvm_artifacts_configured && state_.input_configured;
+    std::cout << "Ready to run: " << (ready ? "Yes" : "No") << std::endl;
+
+    return CommandResult::SUCCESS;
+}
+
+PipelineManager::CommandResult PipelineManager::handleQuit(const std::vector<std::string>& args)
+{
+    std::cout << "[App] Exiting..." << std::endl;
+    return CommandResult::QUIT;
+}
+
+bool PipelineManager::validateConfiguration()
+{
+    if (!state_.pipeline_config.loaded) {
+        std::cout << "[App] Error: No pipeline configuration loaded" << std::endl;
+        std::cout << "Use 'pipeline <file.json>' to load a pipeline configuration" << std::endl;
         return false;
     }
 
-    // Reinitialize Generic Task client with new buffer sizes if needed
-    if (initialized_ && generic_client_) {
-        generic_client_.reset();
-        generic_client_ = std::make_unique<GenericTaskClient>();
-        if (!generic_client_->initialize(config_.pre_process.input_buffer_size,
-                                        config_.post_process.output_buffer_size)) {
-            std::cerr << "[Pipeline] Failed to reinitialize Generic Task client" << std::endl;
+    bool has_tvm_stages = false;
+    for (const auto& stage : state_.pipeline_config.stages) {
+        if (stage.service == "tvm") {
+            has_tvm_stages = true;
+            break;
+        }
+    }
+
+    if (has_tvm_stages && !state_.tvm_artifacts_configured) {
+        std::cout << "[App] Error: Pipeline has TVM stages but no TVM artifacts configured" << std::endl;
+        std::cout << "Use 'tvm_artifacts <file1.so> ...' to configure TVM artifacts" << std::endl;
+        return false;
+    }
+
+    if (!state_.input_configured) {
+        std::cout << "[App] Error: No input data configured" << std::endl;
+        std::cout << "Use 'input <file>' to configure input data" << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+std::string PipelineManager::getCurrentPrompt()
+{
+    return app_name_ + "> ";
+}
+
+void PipelineManager::registerCommand(const std::string& name, const std::string& description,
+                    const std::vector<std::string>& examples,
+                    std::function<CommandResult(const std::vector<std::string>&)> handler)
+{
+    commands_[name] = {description, examples, handler};
+}
+
+PipelineManager::CommandResult PipelineManager::executeTensorPipeline() {
+    std::cout << "\n[App] === Executing Tensor-Only Pipeline ===" << std::endl;
+
+    // Verify we have exactly 1 TVM stage
+    if (state_.pipeline_config.stages.size() != 1 ||
+        state_.pipeline_config.stages[0].service != "tvm") {
+        std::cout << "[App] Error: Tensor pipeline must have exactly 1 TVM stage" << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    // Initialize TVM client
+    if (!tvm_client_->is_initialized()) {
+        std::cout << "[App] Initializing TVM client..." << std::endl;
+        if (!tvm_client_->initialize(state_.tvm_artifacts_paths[0])) {
+            std::cout << "[App] Error: Failed to initialize TVM client" << std::endl;
+            return CommandResult::ERROR;
+        }
+    }
+
+    // Run inference directly with NPZ file
+    std::cout << "[App] Running TVM inference with NPZ input: " << state_.current_input_file << std::endl;
+
+    if (!tvm_client_->run_inference_with_npz(state_.current_input_file)) {
+        std::cout << "[App] Error: TVM inference failed" << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    // Save output to .bin file
+    std::string output_file = state_.current_input_file.substr(0, state_.current_input_file.find_last_of('.')) + "_output.bin";
+
+    const std::vector<float>& output = tvm_client_->get_output();
+    if (!saveTensorFile(output_file, output)) {
+        std::cout << "[App] Error: Failed to save output tensor" << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    std::cout << "[App] Output saved to: " << output_file << std::endl;
+    std::cout << "[App] Pipeline completed successfully" << std::endl;
+
+    return CommandResult::SUCCESS;
+}
+
+PipelineManager::CommandResult PipelineManager::executeAudioPipeline() {
+    std::cout << "\n[App] === Executing Audio Pipeline ===" << std::endl;
+
+    // Determine pipeline type
+    bool has_stft = false;
+    bool has_tvm = false;
+    bool has_istft = false;
+
+    for (const auto& stage : state_.pipeline_config.stages) {
+        if (stage.message_type == "C7X_MSG_STFT_ANALYZE") has_stft = true;
+        if (stage.service == "tvm") has_tvm = true;
+        if (stage.message_type == "C7X_MSG_ISTFT_SYNTHESIZE") has_istft = true;
+    }
+
+    std::cout << "[App] Pipeline stages: "
+              << (has_stft ? "STFT " : "")
+              << (has_tvm ? "TVM " : "")
+              << (has_istft ? "ISTFT" : "") << std::endl;
+
+    // For audio pipelines, use existing implementation
+    return executeSequentialPipeline();
+}
+
+PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
+{
+    // Router logic: Dispatch to appropriate pipeline executor
+    if (state_.input_type == InputType::TENSOR_NPZ) {
+        return executeTensorPipeline();
+    } else if (state_.input_type == InputType::AUDIO_WAV) {
+        // Continue with audio pipeline execution below
+    } else {
+        std::cout << "[App] Error: Unknown input type" << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    std::cout << "[App] Loading input data: " << state_.current_input_file << std::endl;
+
+    // Load audio file
+    std::vector<int16_t> audio_data;
+    if (!loadAudioFile(state_.current_input_file, audio_data)) {
+        return CommandResult::ERROR;
+    }
+    std::cout << "[App] Audio pipeline: loaded " << audio_data.size() << " samples" << std::endl;
+
+    // STFT/ISTFT configuration from TI model_config.h (DCCRN model)
+    const size_t STFT_INPUT_SAMPLES = 512;     // Audio samples for GTCRN (matches FFT_SIZE exactly)
+    const size_t STFT_SPEC_ELEMS = 514;        // Spectral elements (1 window × 514 bins)
+
+    size_t audio_chunk_samples = STFT_INPUT_SAMPLES;
+    size_t audio_chunk_bytes = audio_chunk_samples * sizeof(int16_t);     // 800 bytes (400 samples)
+    size_t spectral_data_bytes = STFT_SPEC_ELEMS * sizeof(float);         // ~2KB (514 elements)
+
+    std::cout << "[App] STFT configuration:" << std::endl;
+    std::cout << "[App]   Audio chunk: " << audio_chunk_samples << " samples (" << audio_chunk_bytes << " bytes)" << std::endl;
+    std::cout << "[App]   Spectral data: " << STFT_SPEC_ELEMS << " elements (" << spectral_data_bytes << " bytes)" << std::endl;
+
+    // Initialize generic client
+    if (!generic_client_->initialize()) {
+        std::cout << "[App] Error: Failed to initialize Generic Task client" << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    // Initialize TVM client with artifacts if configured
+    if (state_.tvm_artifacts_configured && !tvm_client_->is_initialized()) {
+        if (!tvm_client_->initialize(state_.tvm_artifacts_paths[0])) {
+            std::cout << "[App] Error: Failed to initialize TVM client" << std::endl;
+            std::cout << "[App] WARNING: Continuing without TVM" << std::endl;
+        }
+    }
+
+    // Allocate DMA buffers for the pipeline stages (STFT/ISTFT)
+    struct dma_buf_params dma_buf1, dma_buf2, dma_buf3;
+    std::cout << "[App] Allocating DMA buffers from linux,cma heap..." << std::endl;
+    std::cout << "[App] Using fixed TVM memory addresses:" << std::endl;
+    std::cout << "[App]   TVM_INPUT_ADDR:  0x" << std::hex << TVM_INPUT_ADDR << std::dec << std::endl;
+    std::cout << "[App]   TVM_OUTPUT_ADDR: 0x" << std::hex << TVM_OUTPUT_ADDR << std::dec << std::endl;
+
+    // DMA Buffer 1: STFT input (audio samples)
+    int ret1 = dmabuf_heap_init("linux,cma",
+                                audio_chunk_bytes, "/dev/remoteproc0", &dma_buf1);
+    if (ret1 != 0) {
+        std::cout << "[App] Error: Failed to allocate DMA buffer 1 (STFT input)" << std::endl;
+        return CommandResult::ERROR;
+    }
+
+    // DMA Buffer 2: STFT output / ISTFT input (spectral data - larger!)
+    int ret2 = dmabuf_heap_init("linux,cma",
+                                spectral_data_bytes, "/dev/remoteproc0", &dma_buf2);
+    if (ret2 != 0) {
+        std::cout << "[App] Error: Failed to allocate DMA buffer 2 (STFT output / ISTFT input)" << std::endl;
+        dmabuf_heap_destroy(&dma_buf1);
+        return CommandResult::ERROR;
+    }
+
+    // DMA Buffer 3: ISTFT output (audio samples)
+    int ret3 = dmabuf_heap_init("linux,cma",
+                                audio_chunk_bytes, "/dev/remoteproc0", &dma_buf3);
+    if (ret3 != 0) {
+        std::cout << "[App] Error: Failed to allocate DMA buffer 3 (ISTFT output)" << std::endl;
+        dmabuf_heap_destroy(&dma_buf1);
+        dmabuf_heap_destroy(&dma_buf2);
+        return CommandResult::ERROR;
+    }
+
+    std::cout << "[App] DMA buffer allocation successful:" << std::endl;
+    std::cout << "[App]   DMA Buffer 1 (STFT input):  phys=0x" << std::hex << dma_buf1.phys_addr
+              << ", virt=" << dma_buf1.kern_addr << ", size=" << std::dec << dma_buf1.size << std::endl;
+    std::cout << "[App]   DMA Buffer 2 (STFT→ISTFT):  phys=0x" << std::hex << dma_buf2.phys_addr
+              << ", virt=" << dma_buf2.kern_addr << ", size=" << std::dec << dma_buf2.size << std::endl;
+    std::cout << "[App]   DMA Buffer 3 (ISTFT output): phys=0x" << std::hex << dma_buf3.phys_addr
+              << ", virt=" << dma_buf3.kern_addr << ", size=" << std::dec << dma_buf3.size << std::endl;
+
+    std::cout << "[App] Sequential processing of " << audio_data.size() << " samples" << std::endl;
+
+    // STREAMING TESTING: Process 6 chunks to verify streaming normalization
+    size_t total_chunks = 1;  // Process 1 chunk to test cold-start fix
+    std::cout << "[App] STREAMING MODE: Processing 6 chunks for streaming verification" << std::endl;
+    std::cout << "[App] Total chunks to process: " << total_chunks << std::endl;
+
+    // Collect all processed audio chunks for final output file
+    std::vector<int16_t> processed_audio_data;
+    processed_audio_data.reserve(audio_data.size());
+
+    for (size_t chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
+        size_t chunk_start = chunk_idx * audio_chunk_samples;
+        size_t chunk_end = std::min(chunk_start + audio_chunk_samples, audio_data.size());
+        size_t actual_samples = chunk_end - chunk_start;
+        size_t actual_bytes = actual_samples * sizeof(int16_t);
+
+        std::cout << "\n[App] Processing chunk " << (chunk_idx + 1) << "/" << total_chunks
+                  << " (" << actual_samples << " samples, " << (actual_bytes/1024) << "KB)" << std::endl;
+
+        // Track TVM success status for later use in ISTFT
+        bool tvm_success = false;
+
+        // === THREE-STAGE SEQUENTIAL PIPELINE ===
+
+        // Step 1: Copy audio chunk TO DMA Buffer 1 (STFT input)
+        std::cout << "[App] Step 1: Copying audio chunk to DMA Buffer 1 (STFT input)..." << std::endl;
+
+        // Calculate input RMS for verification
+        float input_sum = 0.0f;
+        for (size_t i = chunk_start; i < chunk_start + actual_samples; i++) {
+            float sample = (float)audio_data[i] / 32768.0f;
+            input_sum += sample * sample;
+        }
+        float input_rms = sqrtf(input_sum / actual_samples);
+        std::cout << "[App] Input chunk RMS: " << input_rms << std::endl;
+
+        dmabuf_sync(dma_buf1.dma_buf_fd, DMA_BUF_SYNC_START);
+        memcpy(dma_buf1.kern_addr, &audio_data[chunk_start], actual_bytes);
+
+        // Debug: Show STFT input samples from DMA Buffer 1
+        int16_t* input_samples = (int16_t*)dma_buf1.kern_addr;
+        std::cout << "[App] DEBUG: STFT INPUT (DMA Buf 1) first 8 samples: ";
+        for (int i = 0; i < 8; i++) {
+            std::cout << input_samples[i] << " ";
+        }
+        std::cout << std::endl;
+
+        dmabuf_sync(dma_buf1.dma_buf_fd, DMA_BUF_SYNC_END);
+
+        // Get stage configurations - all 3 stages
+        const auto& stft_stage = state_.pipeline_config.stages[0];
+        const auto& tvm_stage = state_.pipeline_config.stages[1];
+        const auto& istft_stage = state_.pipeline_config.stages[2];
+
+        // === THREE-STAGE PIPELINE: STFT → TVM → ISTFT ===
+
+        // Step 2: STFT analyze (DMA Buffer 1 → DMA Buffer 2)
+        std::cout << "[App] Step 2: STFT analyze (DMA Buffer 1 → DMA Buffer 2)..." << std::endl;
+
+        // Update STFT parameters to output to DMA Buffer 2 (no TVM)
+        auto stft_params = stft_stage.parameters;
+        char input_addr_str[32], output_addr_str[32];
+        snprintf(input_addr_str, sizeof(input_addr_str), "0x%lx", dma_buf1.phys_addr);
+        snprintf(output_addr_str, sizeof(output_addr_str), "0x%lx", dma_buf2.phys_addr); // Direct to DMA Buffer 2
+        stft_params["input_buffer"] = input_addr_str;
+        stft_params["output_buffer"] = output_addr_str;
+
+        // GTCRN STFT produces 4112 bytes spectral data (1028 elements * 4 bytes)
+        size_t gtcrn_spectral_bytes = 4112;  // Match actual firmware output
+
+        auto stft_result = generic_client_->process(
+            stft_stage.message_type,
+            nullptr, actual_bytes, nullptr, gtcrn_spectral_bytes,
+            stft_params
+        );
+
+        if (!stft_result.success) {
+            std::cout << "[App] Error: STFT analyze failed: " << stft_result.error_message << std::endl;
+            return CommandResult::ERROR;
+        }
+
+        std::cout << "[App] STFT analyze success: input=" << stft_result.input_size
+                  << " bytes, output=" << stft_result.output_size << " bytes" << std::endl;
+
+        // Step 3: Verify STFT output in DMA Buffer 2
+        std::cout << "[App] Step 3: Verifying STFT output in DMA Buffer 2..." << std::endl;
+        dmabuf_sync(dma_buf2.dma_buf_fd, DMA_BUF_SYNC_START);
+
+        // Debug: Read spectral data from STFT output (float values)
+        float* spectral_data = (float*)dma_buf2.kern_addr;
+        std::cout << "[App] DEBUG: STFT OUTPUT (DMA Buf 2) first 8 spectral values: ";
+        for (int i = 0; i < 8; i++) {
+            printf("%.6f ", spectral_data[i]);
+        }
+        std::cout << std::endl;
+
+        // Keep the old verification for RMS calculation
+        std::vector<int16_t> stft_output(actual_samples);
+        memcpy(stft_output.data(), dma_buf2.kern_addr, std::min(actual_bytes, spectral_data_bytes));
+        dmabuf_sync(dma_buf2.dma_buf_fd, DMA_BUF_SYNC_END);
+
+        // Calculate STFT output RMS
+        float stft_sum = 0.0f;
+        int16_t stft_peak = 0;
+        for (size_t i = 0; i < actual_samples; i++) {
+            float sample = (float)stft_output[i] / 32768.0f;
+            stft_sum += sample * sample;
+            if (abs(stft_output[i]) > abs(stft_peak)) {
+                stft_peak = stft_output[i];
+            }
+        }
+        float stft_rms = sqrtf(stft_sum / actual_samples);
+
+        std::cout << "[App] STFT output RMS: " << stft_rms << ", Peak: " << stft_peak << std::endl;
+        if (stft_rms < 0.001f && input_rms > 0.01f) {
+            std::cout << "[App] WARNING: STFT output very low - may not be processing!" << std::endl;
+        } else {
+            std::cout << "[App] ✓ STFT processing verified" << std::endl;
+        }
+
+        // Step 4: TVM inference (ENABLED with fixed hardcoded addresses)
+        std::cout << "[App] Step 4: TVM inference processing..." << std::endl;
+
+        uint64_t istft_input_phys_addr = dma_buf2.phys_addr;  // Default: STFT output
+
+        if (state_.tvm_artifacts_configured && tvm_client_->is_initialized()) {
+            // Step 4a: Get STFT output data
+            std::cout << "[App]   Step 4a: Preparing STFT output for TVM inference..." << std::endl;
+
+            dmabuf_sync(dma_buf2.dma_buf_fd, DMA_BUF_SYNC_START);
+
+            // Get STFT output data from DMA Buffer 2
+            float* stft_output_data = (float*)dma_buf2.kern_addr;
+            size_t stft_output_size = stft_result.output_size > 0 ? stft_result.output_size : spectral_data_bytes;
+
+            std::cout << "[App]   ✓ STFT output ready:" << std::endl;
+            std::cout << "[App]     Size: " << stft_output_size << " bytes (" << (stft_output_size / 4) << " floats)" << std::endl;
+            std::cout << "[App]     Data pointer: " << (void*)stft_output_data << std::endl;
+            std::cout << "[App]     First 4 values: ";
+            for (int i = 0; i < 4; i++) {
+                printf("%f ", stft_output_data[i]);
+            }
+            std::cout << std::endl;
+
+            std::cout << "[App]   TVM Model Configuration:" << std::endl;
+            std::cout << "[App]     Expected input size: (check model artifacts)" << std::endl;
+            std::cout << "[App]     Actual STFT output: " << stft_output_size << " bytes" << std::endl;
+
+            std::cout << "[App]   Fixed Memory Addresses:" << std::endl;
+            std::cout << "[App]     TVM_INPUT_ADDR:  0x" << std::hex << TVM_INPUT_ADDR << std::dec
+                      << " (staging buffer from C7x)" << std::endl;
+            std::cout << "[App]     TVM_OUTPUT_ADDR: 0x" << std::hex << TVM_OUTPUT_ADDR << std::dec
+                      << " (result buffer from C7x)" << std::endl;
+
+            // Step 4b: Run TVM inference with STFT output
+            std::cout << "[App]   Step 4b: Calling TVM inference..." << std::endl;
+            std::cout << "[App]     Input buffer: " << (void*)stft_output_data << std::endl;
+            std::cout << "[App]     Input size: " << stft_output_size << " bytes" << std::endl;
+
+            tvm_success = tvm_client_->run_inference_with_data(
+                (void*)stft_output_data,
+                stft_output_size
+            );
+
+            dmabuf_sync(dma_buf2.dma_buf_fd, DMA_BUF_SYNC_END);
+
+            std::cout << "[App]   Step 4b Result: " << (tvm_success ? "SUCCESS" : "FAILED") << std::endl;
+
+            if (!tvm_success) {
+                std::cout << "[App] ✗ ERROR: TVM inference failed!" << std::endl;
+                std::cout << "[App] PIPELINE ABORTED - Stage 4 (TVM) failed" << std::endl;
+                dmabuf_heap_destroy(&dma_buf1);
+                dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf3);
+                return CommandResult::ERROR;
+            } else {
+                std::cout << "[App] ✓ TVM inference completed successfully" << std::endl;
+                std::cout << "[App]   TVM output is available at 0x" << std::hex << TVM_OUTPUT_ADDR << std::dec << std::endl;
+                std::cout << "[App]   ISTFT will read from this address in next step" << std::endl;
+                istft_input_phys_addr = TVM_OUTPUT_ADDR;  // Use TVM output for ISTFT
+            }
+        }
+        else {
+            std::cout << "[App] TVM stage not configured - using STFT output for ISTFT" << std::endl;
+        }
+        std::cout << "[App] TVM stage complete" << std::endl;
+
+        // Step 5: ISTFT synthesize
+        std::cout << "[App] Step 5: ISTFT synthesize..." << std::endl;
+
+        std::string istft_input_source = (istft_input_phys_addr == TVM_OUTPUT_ADDR)
+            ? "TVM output (0x" + std::to_string(TVM_OUTPUT_ADDR) + ")"
+            : "STFT output (DMA Buffer 2)";
+        std::cout << "[App]   ISTFT input source: " << istft_input_source << std::endl;
+
+        // Update ISTFT parameters with correct input source
+        auto istft_params = istft_stage.parameters;
+        snprintf(input_addr_str, sizeof(input_addr_str), "0x%lx", istft_input_phys_addr);
+        snprintf(output_addr_str, sizeof(output_addr_str), "0x%lx", dma_buf3.phys_addr);
+        istft_params["input_buffer"] = input_addr_str;
+        istft_params["output_buffer"] = output_addr_str;
+
+        // Debug: Log exact addresses being sent to firmware
+        std::cout << "[App] DEBUG: ISTFT addresses being sent:" << std::endl;
+        std::cout << "[App]   input_buffer (" << istft_input_source << "): phys=0x" << std::hex << istft_input_phys_addr << std::dec << std::endl;
+        std::cout << "[App]   output_buffer (DMA Buf 3): phys=0x" << std::hex << dma_buf3.phys_addr
+                  << ", virt=" << dma_buf3.kern_addr << std::dec << std::endl;
+
+        // Debug: Verify ISTFT input before processing
+        if (istft_input_phys_addr == TVM_OUTPUT_ADDR) {
+            // Verify TVM output
+            float* tvm_output_spectral = (float*)(uintptr_t)TVM_OUTPUT_ADDR;
+            std::cout << "[App] DEBUG: ISTFT INPUT (TVM OUTPUT at 0x" << std::hex << TVM_OUTPUT_ADDR
+                      << std::dec << ") first 8 spectral values: ";
+            for (int i = 0; i < 8; i++) {
+                printf("%.6f ", tvm_output_spectral[i]);
+            }
+            std::cout << std::endl;
+        } else {
+            // Verify STFT output (DMA Buffer 2)
+            dmabuf_sync(dma_buf2.dma_buf_fd, DMA_BUF_SYNC_START);
+            float* istft_input_spectral = (float*)dma_buf2.kern_addr;
+            std::cout << "[App] DEBUG: ISTFT INPUT (STFT OUTPUT - DMA Buf 2) first 8 spectral values: ";
+            for (int i = 0; i < 8; i++) {
+                printf("%.6f ", istft_input_spectral[i]);
+            }
+            std::cout << std::endl;
+            dmabuf_sync(dma_buf2.dma_buf_fd, DMA_BUF_SYNC_END);
+        }
+
+        // Clear DMA Buffer 3 before ISTFT to ensure we detect fresh data
+        dmabuf_sync(dma_buf3.dma_buf_fd, DMA_BUF_SYNC_START);
+        memset(dma_buf3.kern_addr, 0xCC, audio_chunk_bytes);  // Fill with pattern 0xCC
+        dmabuf_sync(dma_buf3.dma_buf_fd, DMA_BUF_SYNC_END);
+        std::cout << "[App] DEBUG: Cleared DMA Buffer 3 with pattern 0xCC" << std::endl;
+
+        // Use actual STFT output size, not theoretical size
+        size_t actual_spectral_bytes = (stft_result.output_size > 0) ? stft_result.output_size : spectral_data_bytes;
+
+        // GTCRN ISTFT expects 512 samples = 1024 bytes output per hop
+        size_t gtcrn_audio_bytes = 512 * sizeof(int16_t);  // 1024 bytes
+
+        auto istft_result = generic_client_->process(
+            istft_stage.message_type,
+            nullptr, actual_spectral_bytes, nullptr, gtcrn_audio_bytes,
+            istft_params
+        );
+
+        if (!istft_result.success) {
+            std::cout << "[App] Error: ISTFT synthesize failed: " << istft_result.error_message << std::endl;
+            return CommandResult::ERROR;
+        }
+
+        std::cout << "[App] ISTFT synthesize success: input=" << istft_result.input_size
+                  << " bytes, output=" << istft_result.output_size << " bytes" << std::endl;
+
+        // Step 6: Verify final output in DMA Buffer 3
+        std::cout << "[App] Step 6: Verifying final output in DMA Buffer 3..." << std::endl;
+
+        // Invalidate cache to ensure we read fresh data from firmware
+        dmabuf_sync(dma_buf3.dma_buf_fd, DMA_BUF_SYNC_START);
+
+        // IMPORTANT: Firmware outputs exactly 256 samples per chunk (STFT_HOP_SIZE for GTCRN)
+        // For streaming STFT/ISTFT: output samples = hop size per chunk
+        const size_t firmware_output_samples = 512;  // STFT_OUTPUT_SAMPLES = STFT_NUM_WINDOWS * STFT_HOP_SIZE from model_config.h (GTCRN)
+        const size_t firmware_output_bytes = firmware_output_samples * sizeof(int16_t);
+
+        // Debug: Read ISTFT output directly from DMA Buffer 3
+        int16_t* istft_output_samples = (int16_t*)dma_buf3.kern_addr;
+        std::cout << "[App] DEBUG: ISTFT OUTPUT (DMA Buf 3) first 8 samples: ";
+        for (int i = 0; i < 8; i++) {
+            std::cout << istft_output_samples[i] << " ";
+        }
+        std::cout << std::endl;
+
+        std::vector<int16_t> final_output(firmware_output_samples);
+        memcpy(final_output.data(), dma_buf3.kern_addr, firmware_output_bytes);
+        dmabuf_sync(dma_buf3.dma_buf_fd, DMA_BUF_SYNC_END);
+
+        // Debug: Comprehensive check of DMA Buffer 3 raw memory
+        std::cout << "[App] DEBUG: Checking DMA Buffer 3 raw memory..." << std::endl;
+
+        // Check raw bytes in the buffer (not just our final_output vector)
+        const uint8_t* raw_buffer = (const uint8_t*)dma_buf3.kern_addr;
+        bool has_nonzero_raw = false;
+        size_t nonzero_count = 0;
+
+        for (size_t i = 0; i < firmware_output_bytes; i++) {
+            if (raw_buffer[i] != 0) {
+                has_nonzero_raw = true;
+                nonzero_count++;
+            }
+        }
+
+        std::cout << "[App] DEBUG: DMA Buffer 3 (" << firmware_output_bytes << " bytes total):" << std::endl;
+        std::cout << "[App]   Non-zero bytes: " << nonzero_count << std::endl;
+        std::cout << "[App]   First 16 bytes: ";
+        for (int i = 0; i < 16 && i < (int)firmware_output_bytes; i++) {
+            printf("%02x ", raw_buffer[i]);
+        }
+        std::cout << std::endl;
+
+        // Also check our copied vector
+        bool has_nonzero_data = false;
+        int16_t first_nonzero = 0;
+        size_t first_nonzero_idx = 0;
+        for (size_t i = 0; i < firmware_output_samples; i++) {
+            if (final_output[i] != 0) {
+                if (!has_nonzero_data) {
+                    first_nonzero = final_output[i];
+                    first_nonzero_idx = i;
+                }
+                has_nonzero_data = true;
+            }
+        }
+        std::cout << "[App] Copied vector debug: " << (has_nonzero_data ? "HAS" : "NO") << " non-zero data";
+        if (has_nonzero_data) {
+            std::cout << " (first non-zero: " << first_nonzero << " at index " << first_nonzero_idx << ")";
+        }
+        std::cout << std::endl;
+
+        // Calculate chunk output RMS
+        float output_sum = 0.0f;
+        int16_t output_peak = 0;
+
+        // Debug: Compare first 100 output samples with first 100 input samples
+        std::cout << "[App] DEBUG: First 100 samples comparison (Input vs ISTFT Output):" << std::endl;
+        std::cout << "[App]   Index | Original | Processed | Error" << std::endl;
+
+        float error_sum = 0.0f;
+        int16_t max_error = 0;
+
+        for (size_t i = 0; i < firmware_output_samples; i++) {
+            int16_t original = audio_data[chunk_start + i];  // Current chunk input samples
+            int16_t processed = final_output[i]; // Current chunk output samples
+            int16_t error = abs(original - processed);
+
+            // Print first 10 samples for debugging
+            if (i < 10) {
+                std::cout << "[App]   " << std::setw(5) << i
+                         << " | " << std::setw(8) << original
+                         << " | " << std::setw(9) << processed
+                         << " | " << std::setw(5) << error << std::endl;
+            }
+
+            float sample = (float)processed / 32768.0f;
+            output_sum += sample * sample;
+            error_sum += (float)(error * error);
+
+            if (abs(processed) > abs(output_peak)) output_peak = processed;
+            if (error > max_error) max_error = error;
+        }
+
+        float error_rms = sqrtf(error_sum / firmware_output_samples);
+        std::cout << "[App] Round-trip error RMS: " << error_rms << ", Max error: " << max_error << " samples" << std::endl;
+
+        float output_rms = sqrtf(output_sum / firmware_output_samples);
+
+        std::cout << "[App] Chunk output RMS: " << output_rms << ", Peak: " << output_peak << std::endl;
+
+        // Quality verification - check ISTFT output and round-trip error
+        if (output_rms < 0.001f && input_rms > 0.01f) {
+            std::cout << "[App] ✗ ERROR: ISTFT output RMS very low - pipeline not working!" << std::endl;
+        } else if (error_rms > 1000.0f) {
+            std::cout << "[App] ⚠ WARNING: High round-trip error (RMS > 1000) - STFT/ISTFT may have issues" << std::endl;
+        } else if (error_rms < 100.0f) {
+            std::cout << "[App] ✓ Excellent round-trip quality (RMS < 100)" << std::endl;
+        } else {
+            std::cout << "[App] ✓ ISTFT working - round-trip error RMS: " << error_rms << std::endl;
+        }
+
+        std::cout << "[App] Chunk " << (chunk_idx + 1) << " completed successfully" << std::endl;
+
+        // Collect processed chunk for final output file (hop size = 100 samples per chunk)
+        for (size_t i = 0; i < firmware_output_samples; i++) {
+            processed_audio_data.push_back(final_output[i]);
+        }
+    }
+
+    std::cout << "\n[App] All " << total_chunks << " chunks processed sequentially" << std::endl;
+
+    // Save processed audio to file for verification
+    std::string output_filename = "processed_output.wav";
+    std::cout << "[App] Saving processed audio to: " << output_filename << std::endl;
+
+    if (saveAudioFile(output_filename, processed_audio_data)) {
+        std::cout << "[App] ✓ Successfully saved " << processed_audio_data.size() << " samples to " << output_filename << std::endl;
+    } else {
+        std::cout << "[App] ✗ ERROR: Failed to save processed audio file" << std::endl;
+    }
+
+    // Cleanup DMA buffers
+    std::cout << "[App] Cleaning up DMA buffers..." << std::endl;
+    dmabuf_heap_destroy(&dma_buf1);
+    dmabuf_heap_destroy(&dma_buf2);
+    dmabuf_heap_destroy(&dma_buf3);
+
+    return CommandResult::SUCCESS;
+}
+
+
+
+bool PipelineManager::loadAudioFile(const std::string& filename, std::vector<int16_t>& audio_data)
+{
+    SF_INFO sfinfo;
+    memset(&sfinfo, 0, sizeof(sfinfo));
+
+    SNDFILE* infile = sf_open(filename.c_str(), SFM_READ, &sfinfo);
+    if (!infile) {
+        std::cout << "[App] Error: Failed to open audio file: " << filename << std::endl;
+        return false;
+    }
+
+    // Validate audio format
+    if (sfinfo.channels != 1) {
+        std::cout << "[App] Error: Audio must be mono (1 channel), got " << sfinfo.channels << " channels" << std::endl;
+        sf_close(infile);
+        return false;
+    }
+
+    if (sfinfo.samplerate != 16000) {
+        std::cout << "[App] Warning: Audio sample rate is " << sfinfo.samplerate << "Hz, expected 16kHz" << std::endl;
+    }
+
+    std::cout << "[App] Audio file info: " << sfinfo.frames << " frames, "
+              << sfinfo.samplerate << "Hz, " << sfinfo.channels << " channel(s)" << std::endl;
+
+    // Read all audio data
+    audio_data.resize(sfinfo.frames);
+    sf_count_t frames_read = sf_readf_short(infile, audio_data.data(), sfinfo.frames);
+    sf_close(infile);
+
+    if (frames_read != sfinfo.frames) {
+        std::cout << "[App] Warning: Read " << frames_read << " frames, expected " << sfinfo.frames << std::endl;
+        audio_data.resize(frames_read);
+    }
+
+    std::cout << "[App] Loaded " << audio_data.size() << " audio samples ("
+              << (audio_data.size() / (float)sfinfo.samplerate) << " seconds)" << std::endl;
+
+    return true;
+}
+
+bool PipelineManager::playAudioData(const std::vector<int16_t>& audio_data)
+{
+    snd_pcm_t* pcm_handle;
+    int rc = snd_pcm_open(&pcm_handle, "default", SND_PCM_STREAM_PLAYBACK, 0);
+    if (rc < 0) {
+        std::cout << "[App] Error: Cannot open audio device: " << snd_strerror(rc) << std::endl;
+        return false;
+    }
+
+    // Set audio parameters: 16kHz, 16-bit, mono
+    rc = snd_pcm_set_params(pcm_handle,
+                           SND_PCM_FORMAT_S16_LE,
+                           SND_PCM_ACCESS_RW_INTERLEAVED,
+                           1,      // channels (mono)
+                           16000,  // sample rate
+                           1,      // allow resampling
+                           500000); // latency in microseconds
+
+    if (rc < 0) {
+        std::cout << "[App] Error: Cannot set audio parameters: " << snd_strerror(rc) << std::endl;
+        snd_pcm_close(pcm_handle);
+        return false;
+    }
+
+    // Play audio data
+    std::cout << "[App] Playing processed audio..." << std::endl;
+    snd_pcm_sframes_t frames_written = snd_pcm_writei(pcm_handle, audio_data.data(), audio_data.size());
+
+    if (frames_written < 0) {
+        std::cout << "[App] Error: Audio playback failed: " << snd_strerror(frames_written) << std::endl;
+        snd_pcm_close(pcm_handle);
+        return false;
+    }
+
+    // Wait for playback to complete
+    snd_pcm_drain(pcm_handle);
+    snd_pcm_close(pcm_handle);
+
+    std::cout << "[App] Audio playback completed (" << frames_written << " frames)" << std::endl;
+    return true;
+}
+
+bool PipelineManager::saveAudioFile(const std::string& filename, const std::vector<int16_t>& audio_data)
+{
+    SF_INFO sfinfo;
+    memset(&sfinfo, 0, sizeof(sfinfo));
+
+    // Set output file parameters to match our audio format
+    sfinfo.samplerate = 16000;    // 16kHz
+    sfinfo.channels = 1;          // mono
+    sfinfo.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;  // WAV file with 16-bit PCM
+
+    SNDFILE* outfile = sf_open(filename.c_str(), SFM_WRITE, &sfinfo);
+    if (!outfile) {
+        std::cout << "[App] Error: Failed to create output audio file: " << filename << std::endl;
+        std::cout << "[App] Error details: " << sf_strerror(nullptr) << std::endl;
+        return false;
+    }
+
+    std::cout << "[App] Saving audio to: " << filename << std::endl;
+    std::cout << "[App] Output file info: " << audio_data.size() << " frames, "
+              << sfinfo.samplerate << "Hz, " << sfinfo.channels << " channel(s)" << std::endl;
+
+    // Write audio data to file
+    sf_count_t frames_written = sf_writef_short(outfile, audio_data.data(), audio_data.size());
+    sf_close(outfile);
+
+    if (frames_written != static_cast<sf_count_t>(audio_data.size())) {
+        std::cout << "[App] Warning: Wrote " << frames_written << " frames, expected " << audio_data.size() << std::endl;
+        return false;
+    }
+
+    std::cout << "[App] Successfully saved " << frames_written << " audio samples to " << filename << std::endl;
+    std::cout << "[App] Duration: " << (frames_written / (float)sfinfo.samplerate) << " seconds" << std::endl;
+
+    return true;
+}
+
+bool PipelineManager::loadNpzTensor(const std::string& filename, std::vector<float>& tensor_data, std::vector<size_t>& shape) {
+    try {
+        cnpy::npz_t npz = cnpy::npz_load(filename);
+
+        if (npz.empty()) {
+            std::cout << "[App] Error: NPZ file is empty" << std::endl;
             return false;
         }
-    }
 
-    std::cout << "[Pipeline] Pipeline reconfigured successfully" << std::endl;
-    return true;
-}
+        // Get first array
+        cnpy::NpyArray arr = npz.begin()->second;
 
-PipelineManager::PipelineResult PipelineManager::execute_pipeline(void* input_data, size_t input_size,
-                                                                  DataType data_type, int iterations)
-{
-    PipelineResult result = {};
-    result.success = false;
+        // Copy shape
+        shape = arr.shape;
 
-    if (!initialized_) {
-        result.error_message = "Pipeline not initialized";
-        return result;
-    }
+        // Copy data
+        tensor_data.resize(arr.num_vals);
+        std::memcpy(tensor_data.data(), arr.data<float>(), arr.num_vals * sizeof(float));
 
-
-    std::cout << "[Pipeline] Executing " << iterations << " iterations with "
-              << (data_type == DataType::FLOAT32 ? "float32" : "int16") << " data" << std::endl;
-
-    auto start_time = std::chrono::high_resolution_clock::now();
-    uint32_t total_cycles = 0;
-    int successful_iterations = 0;
-
-    for (int i = 0; i < iterations; i++) {
-
-        // Create input buffer for this iteration
-        void* iteration_input = create_input_buffer(data_type, input_size);
-        if (!iteration_input) {
-            result.error_message = "Failed to create input buffer for iteration " + std::to_string(i);
-            break;
-        }
-
-
-        // Copy input data
-        std::memcpy(iteration_input, input_data, input_size);
-
-        bool iteration_success = true;
-
-        // Execute Pre-processing stage
-        if (config_.pre_process.enabled) {
-            std::cout << "[PRE] Processing input data..." << std::endl;
-            if (!execute_pre_process_stage(iteration_input, input_size, data_type)) {
-                result.error_message = "Pre-processing failed in iteration " + std::to_string(i);
-                iteration_success = false;
-            } else {
-                std::cout << "[PRE] Completed successfully" << std::endl;
-            }
-        }
-
-        // Execute TVM inference stage
-        if (iteration_success && config_.tvm_inference.enabled) {
-            std::cout << "[TVM] Running inference..." << std::endl;
-            if (!execute_tvm_stage(iteration_input, input_size, data_type)) {
-                result.error_message = "TVM inference failed in iteration " + std::to_string(i);
-                iteration_success = false;
-            } else {
-                std::cout << "[TVM] Completed successfully" << std::endl;
-            }
-        }
-
-        // Execute Post-processing stage
-        if (iteration_success && config_.post_process.enabled) {
-            std::cout << "[POST] Processing TVM output..." << std::endl;
-            if (!execute_post_process_stage(nullptr, config_.tvm_inference.output_buffer_size, data_type)) {
-                result.error_message = "Post-processing failed in iteration " + std::to_string(i);
-                iteration_success = false;
-            } else {
-                std::cout << "[POST] Completed successfully" << std::endl;
-            }
-        }
-
-        if (iteration_success) {
-            successful_iterations++;
-        } else {
-            std::cout << "[Pipeline] Iteration " << (i + 1) << " failed: " << result.error_message << std::endl;
-            break;
-        }
-    }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-
-    // Fill result
-    result.success = (successful_iterations == iterations);
-    result.iterations_completed = successful_iterations;
-    result.total_cycles = total_cycles;
-    result.total_duration_ms = duration.count() / 1000.0;
-
-    if (result.success) {
-        std::cout << "[App] Pipeline completed successfully" << std::endl;
-        std::cout << "[App] Total duration: " << std::fixed << std::setprecision(2)
-                  << result.total_duration_ms << " ms" << std::endl;
-    } else {
-        std::cout << "[App] Pipeline failed: " << result.error_message << std::endl;
-    }
-
-    return result;
-}
-
-bool PipelineManager::execute_pre_process_stage(void* input_data, size_t input_size, DataType data_type)
-{
-    if (!generic_client_) {
-        std::cerr << "[Pipeline] Generic Task client not initialized" << std::endl;
-        return false;
-    }
-
-    // Verify Generic Task client is ready (should be initialized in pipeline init)
-    if (!generic_client_->is_ready()) {
-        std::cerr << "[PRE] Generic Task client not ready - pipeline initialization failed" << std::endl;
-        return false;
-    }
-    // Execute pre-processing
-    auto result = generic_client_->pre_process(convert_data_type(data_type),
-                                              input_data, input_size,
-                                              input_data, input_size);  // In-place processing
-
-    if (result.success) {
-        std::cout << "[PRE] Generic Task completed: DSP cycles=" << result.cycles
-                  << ", load=" << result.dsp_load_percent << "%" << std::endl;
         return true;
-    } else {
-        std::cout << "[PRE] Generic Task failed: " << result.error_message << std::endl;
+    } catch (const std::exception& e) {
+        std::cout << "[App] Error loading NPZ: " << e.what() << std::endl;
         return false;
     }
 }
 
-bool PipelineManager::execute_tvm_stage(void* input_data, size_t input_size, DataType data_type)
-{
-    if (!tvm_client_) {
-        std::cerr << "[Pipeline] TVM client not initialized" << std::endl;
+bool PipelineManager::saveTensorFile(const std::string& filename, const std::vector<float>& tensor_data) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cout << "[App] Error: Cannot open file for writing: " << filename << std::endl;
         return false;
     }
 
-    // For simplicity, assume TVM client handles the inference internally
-    // In a full implementation, this would prepare tensors, run inference, etc.
+    file.write(reinterpret_cast<const char*>(tensor_data.data()), tensor_data.size() * sizeof(float));
+    file.close();
 
-    // Prepare input tensor (simplified)
-
-    // Calculate number of elements based on data type
-    size_t element_size = (data_type == DataType::FLOAT32) ? sizeof(float) : sizeof(int16_t);
-    size_t num_elements = input_size / element_size;
-
-    std::cout << "[TVM] Input data prepared: " << num_elements << " elements" << std::endl;
-
-    // Run actual TVM inference
-    if (!tvm_client_->run_inference_benchmark(1)) {
-        std::cerr << "[TVM] Inference failed" << std::endl;
-        return false;
-    }
+    std::cout << "[App] Successfully saved " << tensor_data.size() << " float values ("
+              << (tensor_data.size() * sizeof(float)) << " bytes) to " << filename << std::endl;
 
     return true;
 }
 
-bool PipelineManager::execute_post_process_stage(void* input_data, size_t input_size, DataType data_type)
-{
-    if (!generic_client_) {
-        std::cerr << "[Pipeline] Generic Task client not initialized" << std::endl;
-        return false;
-    }
-
-    // Post-processing: Get TVM output from result buffer and process it
-    // For verification, we'll process the TVM output and save it to a file
-
-    // Get TVM output data - this should be the classification results (1000 floats)
-    if (!tvm_client_ || !tvm_client_->is_initialized()) {
-        std::cerr << "[POST] TVM client not available for output" << std::endl;
-        return false;
-    }
-
-    const auto& tvm_output = tvm_client_->get_output();
-    if (tvm_output.empty()) {
-        std::cerr << "[POST] No TVM output data available" << std::endl;
-        return false;
-    }
-
-    // Process the TVM output through Generic Task (passthrough for now)
-    auto result = generic_client_->post_process(convert_data_type(data_type),
-                                               (void*)tvm_output.data(), tvm_output.size() * sizeof(float),
-                                               (void*)tvm_output.data(), tvm_output.size() * sizeof(float));
-
-    if (!result.success) {
-        std::cerr << "[POST] Generic Task post-processing failed: " << result.error_message << std::endl;
-        return false;
-    }
-
-    // Save post-processed output to file for verification
-    std::string output_file = "/tmp/pipeline_output.bin";
-    std::ofstream file(output_file, std::ios::binary);
-    if (file.is_open()) {
-        file.write((const char*)tvm_output.data(), tvm_output.size() * sizeof(float));
-        file.close();
-        std::cout << "[POST] Output saved to " << output_file << " (" << (tvm_output.size() * sizeof(float)) << " bytes)" << std::endl;
-    }
-
-    return true;
-}
-
-void* PipelineManager::create_input_buffer(DataType data_type, size_t input_size)
-{
-
-    // Ensure input buffer is large enough
-    if (input_buffer_.size() < input_size) {
-        input_buffer_.resize(input_size);
-    }
-
-
-    return input_buffer_.data();
-}
-
-bool PipelineManager::validate_configuration()
-{
-    // At least one stage must be enabled
-    if (!config_.pre_process.enabled && !config_.tvm_inference.enabled && !config_.post_process.enabled) {
-        return false;
-    }
-
-    // Buffer sizes must be reasonable
-    if (config_.pre_process.enabled &&
-        (config_.pre_process.input_buffer_size == 0 || config_.pre_process.output_buffer_size == 0)) {
-        return false;
-    }
-
-    return true;
-}
-
-GenericTaskClient::DataType PipelineManager::convert_data_type(DataType type)
-{
-    switch (type) {
-        case DataType::FLOAT32:
-            return GenericTaskClient::DataType::FLOAT32;
-        case DataType::INT16:
-            return GenericTaskClient::DataType::INT16;
-        default:
-            return GenericTaskClient::DataType::FLOAT32;
-    }
-}
-
-std::vector<float> PipelineManager::extract_classification_results(void* output_data, size_t output_size, DataType data_type)
-{
-    std::vector<float> results;
-
-    if (data_type == DataType::FLOAT32) {
-        float* float_data = static_cast<float*>(output_data);
-        size_t num_classes = output_size / sizeof(float);
-
-        for (size_t i = 0; i < std::min(num_classes, (size_t)10); i++) {  // Top 10 results
-            results.push_back(float_data[i]);
-        }
-    }
-
-    return results;
-}
