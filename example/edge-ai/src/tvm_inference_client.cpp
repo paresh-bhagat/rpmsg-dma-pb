@@ -6,6 +6,7 @@
 #include <random>
 #include <algorithm>
 #include <memory>
+#include <iomanip>
 
 // TVM runtime includes
 #include <tvm/runtime/module.h>
@@ -24,13 +25,14 @@ TvmInferenceClient::~TvmInferenceClient() {
 }
 
 bool TvmInferenceClient::initialize(const std::string& artifacts_path) {
-    artifacts_path_ = artifacts_path;
+    if (initialized_) {
+        cleanup();
+    }
 
-    printf("[TVM] Initializing with artifacts from: %s\n", artifacts_path.c_str());
+    artifacts_path_ = artifacts_path;
 
     try {
         if (!load_artifacts()) {
-            printf("[TVM]  Failed to load artifacts\n");
             return false;
         }
 
@@ -38,7 +40,7 @@ bool TvmInferenceClient::initialize(const std::string& artifacts_path) {
         return true;
 
     } catch (const std::exception& e) {
-        printf("[TVM]  Exception during initialization: %s\n", e.what());
+        std::cerr << "TVM initialization failed: " << e.what() << std::endl;
         return false;
     }
 }
@@ -82,7 +84,7 @@ bool TvmInferenceClient::load_artifacts() {
 
     auto graph_executor_create = Registry::Get("tvm.graph_executor.create");
     if (!graph_executor_create) {
-        printf("[TVM]  Failed to find graph_executor.create function\n");
+        std::cerr << "Failed to find graph_executor.create function" << std::endl;
         return false;
     }
 
@@ -98,7 +100,7 @@ bool TvmInferenceClient::load_artifacts() {
             Map<String, ObjectRef> empty_map;
             executor = (*graph_executor_create)(String(graph_json), lib, int(kDLCPU), int(0), empty_map);
         } catch (const std::exception& e2) {
-            printf("[TVM] Failed to create graph executor: %s\n", e2.what());
+            std::cerr << "Failed to create graph executor: " << e2.what() << std::endl;
             return false;
         }
     }
@@ -110,13 +112,11 @@ bool TvmInferenceClient::load_artifacts() {
     get_output_ = std::make_unique<PackedFunc>(graph_executor_->GetFunction("get_output"));
 
 
-    // 4. Load parameters
+    // Load model parameters
     std::string param_path = artifacts_path_ + "/deploy_param.params";
-    printf("[TVM] Loading parameters: %s\n", param_path.c_str());
 
     std::ifstream param_file(param_path, std::ios::binary);
     if (!param_file.is_open()) {
-        printf("[TVM]  Failed to open param file: %s\n", param_path.c_str());
         return false;
     }
 
@@ -128,8 +128,6 @@ bool TvmInferenceClient::load_artifacts() {
     param_file.read(reinterpret_cast<char*>(param_data.data()), param_size);
     param_file.close();
 
-    printf("[TVM] Parameters loaded (%zu bytes)\n", param_size);
-
     // Load parameters into executor
     auto load_params = graph_executor_->GetFunction("load_params");
     TVMByteArray param_array;
@@ -140,17 +138,12 @@ bool TvmInferenceClient::load_artifacts() {
 
     // 5. Set up input configuration (MobileNet v2 default)
     input_name_ = "input.1";
-    input_shape_ = {1, 3, 224, 224};  // NCHW format
-
-    printf("[TVM] Input configuration: %s, shape=[%d,%d,%d,%d]\n",
-           input_name_.c_str(), input_shape_[0], input_shape_[1],
-           input_shape_[2], input_shape_[3]);
+    input_shape_ = {1, 3, 224, 224};
 
     return true;
 }
 
 bool TvmInferenceClient::prepare_input_data() {
-    // Calculate input size
     int input_size = 1;
     for (int dim : input_shape_) {
         input_size *= dim;
@@ -158,7 +151,6 @@ bool TvmInferenceClient::prepare_input_data() {
 
     input_data_.resize(input_size);
 
-    // Generate random input data (like Python script)
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> dis(0.0f, 1.0f);
@@ -167,7 +159,6 @@ bool TvmInferenceClient::prepare_input_data() {
         input_data_[i] = dis(gen);
     }
 
-    printf("[TVM] Input data prepared: %d elements\n", input_size);
     return true;
 }
 
@@ -185,17 +176,12 @@ void TvmInferenceClient::process_output_data() {
 
 bool TvmInferenceClient::run_inference_benchmark(int num_iterations) {
     if (!initialized_) {
-        printf("[TVM]  Client not initialized\n");
         return false;
     }
 
-    printf("[TVM] Preparing input data...\n");
     if (!prepare_input_data()) {
         return false;
     }
-
-    printf("[TVM] Running inference benchmark (%d iterations)...\n", num_iterations);
-    printf("------------------------------\n");
 
     std::vector<double> times;
 
@@ -220,7 +206,7 @@ bool TvmInferenceClient::run_inference_benchmark(int num_iterations) {
             process_output_data();
 
         } catch (const std::exception& e) {
-            printf("[TVM]  Inference %d failed: %s\n", i + 1, e.what());
+            std::cerr << "Inference " << (i + 1) << " failed: " << e.what() << std::endl;
             return false;
         }
 
@@ -231,10 +217,8 @@ bool TvmInferenceClient::run_inference_benchmark(int num_iterations) {
         times.push_back(time_ms);
 
         if (i == 0) {
-            printf("First run (includes init): %.2f ms\n", time_ms);
-            printf("Output shape: (1, 1000)\n");
-        } else if (i < 3) {
-            printf("Run %d: %.2f ms\n", i + 1, time_ms);
+            std::cout << "First run (includes init): " << std::fixed << std::setprecision(2) << time_ms << " ms" << std::endl;
+            std::cout << "Output shape: (1, 1000)" << std::endl;
         }
     }
 
@@ -254,16 +238,6 @@ bool TvmInferenceClient::run_inference_benchmark(int num_iterations) {
         avg_time /= steady_times.size();
 
         double fps = 1000.0 / avg_time;
-
-        printf("\nPerformance Results:\n");
-        printf("  Average: %.2f ms\n", avg_time);
-        printf("  Min:     %.2f ms\n", min_time);
-        printf("  Max:     %.2f ms\n", max_time);
-        printf("  FPS:     %.1f\n", fps);
-
-        printf("\nInference completed successfully!\n");
-        printf("   Average inference time: %.2f ms\n", avg_time);
-        printf("   Using TVM+TIDL on AM62D C7x DSP\n");
     }
 
     return true;
@@ -271,12 +245,8 @@ bool TvmInferenceClient::run_inference_benchmark(int num_iterations) {
 
 void TvmInferenceClient::print_top5_results() {
     if (output_data_.size() != 1000) {
-        printf("[TVM]  Expected 1000 output classes, got %zu\n", output_data_.size());
         return;
     }
-
-    printf("\nModel Output:\n");
-    printf("  Raw output shape: (1, 1000)\n");
 
     // Find top 5 indices
     std::vector<std::pair<float, int>> scores;
@@ -285,10 +255,4 @@ void TvmInferenceClient::print_top5_results() {
     }
 
     std::sort(scores.begin(), scores.end(), std::greater<std::pair<float, int>>());
-
-    printf("  Top 5 ImageNet predictions:\n");
-    for (int i = 0; i < 5; i++) {
-        printf("    %d. Class %4d: %.4f (%.2f%%)\n",
-               i + 1, scores[i].second, scores[i].first, scores[i].first * 100.0f);
-    }
 }
