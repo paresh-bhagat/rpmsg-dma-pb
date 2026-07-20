@@ -1,14 +1,15 @@
 {
   "pipeline_id": "audio_stft_istft",
   "description": "STFT round-trip pipeline: STFT analyze -> ISTFT synthesize (no TVM)",
+  "input_file": "/usr/share/tvm_inference/input/input_audio.wav",
   "stages": [
     {
       "stage_id": "stft_analysis",
       "service": "generic",
       "message_type": "C7X_MSG_STFT_ANALYZE",
       "parameters": {
-        "input_size": "1024",
-        "graph_id": "0"
+        "input_size": "15360",
+        "output_size": "61680"
       }
     },
     {
@@ -16,8 +17,8 @@
       "service": "generic",
       "message_type": "C7X_MSG_ISTFT_SYNTHESIZE",
       "parameters": {
-        "input_size": "1028",
-        "graph_id": "0"
+        "input_size": "61680",
+        "output_size": "15360"
       }
     }
   ]

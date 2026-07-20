@@ -128,14 +128,14 @@ GenericTaskClient::ProcessingResult GenericTaskClient::process(const std::string
                          std::stoul(output_size_it->second) : output_size;
         req.graph_id = (graph_id_it != parameters.end()) ?
                       std::stoul(graph_id_it->second) : 0;
-
+#ifdef DEBUG
         std::cout << "[GenericClient] STFT_ANALYZE - Sending to firmware:" << std::endl;
         std::cout << "[GenericClient]   input_buffer=0x" << std::hex << req.input_buffer << std::endl;
         std::cout << "[GenericClient]   output_buffer=0x" << std::hex << req.output_buffer << std::endl;
         std::cout << "[GenericClient]   input_size=" << std::dec << req.input_size << " bytes" << std::endl;
         std::cout << "[GenericClient]   output_size=" << std::dec << req.output_size << " bytes" << std::endl;
         std::cout << "[GenericClient]   graph_id=" << req.graph_id << std::endl;
-
+#endif
         if (send_msg(rpmsg_fd_, (char*)&req, sizeof(req)) < 0) {
             result.error_message = "Failed to send STFT analyze message";
             return result;
@@ -152,12 +152,12 @@ GenericTaskClient::ProcessingResult GenericTaskClient::process(const std::string
             result.error_message = "Invalid STFT analyze response type";
             return result;
         }
-
+#ifdef DEBUG
         std::cout << "[GenericClient] STFT_ANALYZE - Firmware responded:" << std::endl;
         std::cout << "[GenericClient]   status=" << resp.hdr.status << std::endl;
         std::cout << "[GenericClient]   resp.input_size=" << resp.input_size << " bytes" << std::endl;
         std::cout << "[GenericClient]   resp.output_size=" << resp.output_size << " bytes" << std::endl;
-
+#endif
         if (resp.hdr.status != C7X_STATUS_SUCCESS) {
             result.error_message = "DSP STFT analyze failed";
             return result;
@@ -191,14 +191,14 @@ GenericTaskClient::ProcessingResult GenericTaskClient::process(const std::string
                          std::stoul(output_size_it->second) : output_size;
         req.graph_id = (graph_id_it != parameters.end()) ?
                       std::stoul(graph_id_it->second) : 0;
-
+#ifdef DEBUG
         std::cout << "[GenericClient] ISTFT_SYNTHESIZE - Sending to firmware:" << std::endl;
         std::cout << "[GenericClient]   input_buffer=0x" << std::hex << req.input_buffer << std::endl;
         std::cout << "[GenericClient]   output_buffer=0x" << std::hex << req.output_buffer << std::endl;
         std::cout << "[GenericClient]   input_size=" << std::dec << req.input_size << " bytes" << std::endl;
         std::cout << "[GenericClient]   output_size=" << std::dec << req.output_size << " bytes" << std::endl;
         std::cout << "[GenericClient]   graph_id=" << req.graph_id << std::endl;
-
+#endif
         if (send_msg(rpmsg_fd_, (char*)&req, sizeof(req)) < 0) {
             result.error_message = "Failed to send ISTFT synthesize message";
             return result;
@@ -215,12 +215,12 @@ GenericTaskClient::ProcessingResult GenericTaskClient::process(const std::string
             result.error_message = "Invalid ISTFT synthesize response type";
             return result;
         }
-
+#ifdef DEBUG
         std::cout << "[GenericClient] ISTFT_SYNTHESIZE - Firmware responded:" << std::endl;
         std::cout << "[GenericClient]   status=" << resp.hdr.status << std::endl;
         std::cout << "[GenericClient]   resp.input_size=" << resp.input_size << " bytes" << std::endl;
         std::cout << "[GenericClient]   resp.output_size=" << resp.output_size << " bytes" << std::endl;
-
+#endif
         if (resp.hdr.status != C7X_STATUS_SUCCESS) {
             result.error_message = "DSP ISTFT synthesize failed";
             return result;

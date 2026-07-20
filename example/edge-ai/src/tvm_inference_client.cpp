@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <memory>
 #include <iomanip>
-#include <cnpy.h>
+
 
 // TVM runtime includes
 #include <tvm/runtime/module.h>
@@ -216,11 +216,12 @@ bool TvmInferenceClient::run_inference_benchmark(int num_iterations) {
         double time_ms = duration.count() / 1000.0;
 
         times.push_back(time_ms);
-
+#ifdef DEBUG
         if (i == 0) {
             std::cout << "First run (includes init): " << std::fixed << std::setprecision(2) << time_ms << " ms" << std::endl;
             std::cout << "Output shape: (1, 1000)" << std::endl;
         }
+#endif
     }
 
     if (times.size() > 1) {
@@ -299,71 +300,51 @@ bool TvmInferenceClient::run_inference_with_data(const void* input_data, size_t 
     }
 }
 
-bool TvmInferenceClient::run_inference_with_npz(const std::string& npz_path) {
+bool TvmInferenceClient::run_inference_from_bin(const std::string& bin_path) {
     if (!initialized_) {
-        std::cerr << "TVM client not initialized" << std::endl;
+        std::cerr << "[TVM] Not initialized" << std::endl;
         return false;
     }
 
+    std::ifstream f(bin_path, std::ios::binary);
+    if (!f.is_open()) {
+        std::cerr << "[TVM] Cannot open: " << bin_path << std::endl;
+        return false;
+    }
+    f.seekg(0, std::ios::end);
+    size_t file_bytes = f.tellg();
+    f.seekg(0, std::ios::beg);
+
+    size_t num_floats = file_bytes / sizeof(float);
+    input_data_.resize(num_floats);
+    f.read(reinterpret_cast<char*>(input_data_.data()), file_bytes);
+    f.close();
+
+    std::cout << "[TVM] Loaded " << num_floats << " floats from " << bin_path << std::endl;
+
     try {
-        std::cout << "[TVM] Loading NPZ file: " << npz_path << std::endl;
-
-        // Load NPZ file
-        cnpy::npz_t npz_data = cnpy::npz_load(npz_path);
-
-        if (npz_data.empty()) {
-            std::cerr << "[TVM] Error: NPZ file is empty or invalid" << std::endl;
-            return false;
-        }
-
-        // Get first array from NPZ (or use hardcoded key like "input_0")
-        cnpy::NpyArray npz_array;
-        if (npz_data.find("input_0") != npz_data.end()) {
-            npz_array = npz_data["input_0"];
-        } else {
-            npz_array = npz_data.begin()->second;
-        }
-
-        std::cout << "[TVM] NPZ array shape: [";
-        for (size_t i = 0; i < npz_array.shape.size(); i++) {
-            std::cout << npz_array.shape[i];
-            if (i < npz_array.shape.size() - 1) std::cout << ", ";
-        }
-        std::cout << "]" << std::endl;
-
-        // Update input shape from NPZ
-        input_shape_.clear();
-        for (size_t dim : npz_array.shape) {
-            input_shape_.push_back(static_cast<int>(dim));
-        }
-
         auto start = std::chrono::high_resolution_clock::now();
 
-        // Create input tensor
-        std::vector<int64_t> shape_vec(input_shape_.begin(), input_shape_.end());
-        NDArray input_array = NDArray::Empty(shape_vec, DLDataType{kDLFloat, 32, 1}, {kDLCPU, 0});
-
-        // Copy NPZ data
-        input_array.CopyFromBytes(npz_array.data<float>(), npz_array.num_vals * sizeof(float));
-
-        // Set input
-        (*set_input_)(0, input_array);  // Use index 0 instead of name
-
-        // Run inference
+        std::vector<int64_t> shape = {static_cast<int64_t>(num_floats)};
+        NDArray input_array = NDArray::Empty(shape, DLDataType{kDLFloat, 32, 1}, {kDLCPU, 0});
+        input_array.CopyFromBytes(input_data_.data(), input_data_.size() * sizeof(float));
+        (*set_input_)(0, input_array);
         (*run_)();
 
-        // Get output
-        process_output_data();
+        NDArray out = (*get_output_)(0);
+        size_t out_bytes = 1;
+        for (int i = 0; i < out->ndim; i++) out_bytes *= out->shape[i];
+        output_data_.resize(out_bytes);
+        out.CopyToBytes(output_data_.data(), out_bytes * sizeof(float));
 
         auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        double time_ms = duration.count() / 1000.0;
+        double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
 
-        std::cout << "[TVM] Inference completed: " << std::fixed << std::setprecision(2) << time_ms << " ms" << std::endl;
+        std::cout << "[TVM] Inference done in " << ms << " ms, output: " << out_bytes << " floats" << std::endl;
         return true;
 
     } catch (const std::exception& e) {
-        std::cerr << "[TVM] NPZ inference failed: " << e.what() << std::endl;
+        std::cerr << "[TVM] Inference failed: " << e.what() << std::endl;
         return false;
     }
 }

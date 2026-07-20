@@ -34,6 +34,8 @@ public:
     struct PipelineConfig {
         std::string pipeline_id;
         std::string description;
+        std::string input_file;
+        std::string artifacts_path;
         std::vector<PipelineStage> stages;
         bool loaded;
 
@@ -43,7 +45,13 @@ public:
     enum class InputType {
         UNKNOWN,
         AUDIO_WAV,
-        TENSOR_NPZ
+        TENSOR_BIN
+    };
+
+    enum class PipelineMode {
+        STFT_ISTFT,   // --ISTFT : STFT -> ISTFT only
+        TVM_ONLY,     // --TVM   : TVM inference only (BIN input)
+        FULL          // --full  : STFT -> TVM -> ISTFT
     };
 
     struct State {
@@ -69,6 +77,8 @@ public:
 
     bool initialize();
     int run();
+    int run_direct(PipelineMode mode, const std::string& input_file, const std::string& artifacts_path = "");
+    int run_from_json_file(const std::string& json_file_path);
 
 private:
     std::shared_ptr<TvmInferenceClient> tvm_client_;
@@ -101,13 +111,14 @@ private:
     CommandResult handleQuit(const std::vector<std::string>& args);
 
     bool validateConfiguration();
+    bool loadPipelineFromJson(const std::string& json_content);
 
     CommandResult executeAudioPipeline();
     CommandResult executeTensorPipeline();
     CommandResult executeSequentialPipeline();
 
     bool loadAudioFile(const std::string& filename, std::vector<int16_t>& audio_data);
-    bool loadNpzTensor(const std::string& filename, std::vector<float>& tensor_data, std::vector<size_t>& shape);
+    bool loadBinTensor(const std::string& filename, std::vector<float>& tensor_data);
     bool saveTensorFile(const std::string& filename, const std::vector<float>& tensor_data);
     bool playAudioData(const std::vector<int16_t>& audio_data);
     bool saveAudioFile(const std::string& filename, const std::vector<int16_t>& audio_data);

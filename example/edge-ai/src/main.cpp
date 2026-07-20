@@ -33,14 +33,6 @@ void signal_handler(int signum)
 {
     printf("\n[App] Received signal %d, shutting down...\n", signum);
 
-    // Switch back to base firmware on exit
-    printf("[App] Switching back to base firmware...\n");
-    if (switch_firmware((char*)C7_BASE_FW, (char*)C7_FW_LINK, (char*)C7_FW_STATE) != 0) {
-        printf("[App] Warning: Failed to switch back to base firmware\n");
-    } else {
-        printf("[App] Base firmware restored\n");
-    }
-
     exit(signum);
 }
 
@@ -54,20 +46,25 @@ void setup_signal_handlers()
 }
 
 /**
- * @brief Initialize firmware for TVM operation
+ * @brief Print command-line usage
  */
-bool initialize_firmware()
+void print_usage(const char* prog_name)
 {
-    printf("[App] Initializing TVM firmware...\n");
-
-    // Switch to TVM firmware
-    if (switch_firmware((char*)C7_TVM_FW, (char*)C7_FW_LINK, (char*)C7_FW_STATE) != 0) {
-        printf("[App] Error: Failed to switch to TVM firmware\n");
-        return false;
-    }
-
-    printf("[App] TVM firmware loaded successfully\n");
-    return true;
+    printf("Usage:\n");
+    printf("  %s                      Interactive mode (readline shell)\n", prog_name);
+    printf("  %s <pipeline.json>      Run pipeline from JSON configuration file\n", prog_name);
+    printf("  %s --help               Show this help\n", prog_name);
+    printf("\nJSON configuration file fields:\n");
+    printf("  pipeline_id     Pipeline identifier string\n");
+    printf("  description     Human-readable description\n");
+    printf("  input_file      Path to input BIN file\n");
+    printf("  output_file     Output data size\n");
+    printf("  artifacts_path  Path to TVM artifacts directory (optional, for TVM stages)\n");
+    printf("  stages          Array of pipeline stage objects\n");
+    printf("\nExample:\n");
+    printf("  %s pipeline_stft_istft.json\n", prog_name);
+    printf("  %s pipeline_tvm_inference.json\n", prog_name);
+    printf("  %s pipeline_audio_enhancement.json\n", prog_name);
 }
 
 /**
@@ -79,27 +76,35 @@ int main(int argc, char *argv[])
     printf("       RPMsg Inference Example\n");
     printf("===========================================\n\n");
 
+    std::string json_file;
+
+    if (argc >= 2) {
+        std::string arg = argv[1];
+
+        if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg.rfind("--", 0) == 0) {
+            printf("[App] Unknown argument: %s\n", argv[1]);
+            print_usage(argv[0]);
+            return -1;
+        } else {
+            json_file = arg;
+        }
+    }
+
     // Setup signal handlers for graceful shutdown
     setup_signal_handlers();
-
-    // Initialize firmware
-    if (!initialize_firmware()) {
-        printf("[App] Failed to initialize firmware\n");
-        return 1;
-    }
 
     // Create and run pipeline manager
     PipelineManager app;
     g_app = &app;
 
-    int exit_code = app.run();
-
-    // Cleanup: switch back to base firmware
-    printf("[App] Switching back to base firmware...\n");
-    if (switch_firmware((char*)C7_BASE_FW, (char*)C7_FW_LINK, (char*)C7_FW_STATE) != 0) {
-        printf("[App] Warning: Failed to switch back to base firmware\n");
+    int exit_code;
+    if (!json_file.empty()) {
+        exit_code = app.run_from_json_file(json_file);
     } else {
-        printf("[App] Base firmware restored\n");
+        exit_code = app.run();
     }
 
     printf("[App] Application exited with code %d\n", exit_code);

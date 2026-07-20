@@ -42,7 +42,7 @@ public:
     // Inference
     bool run_inference_benchmark(int num_iterations = 10);
     bool run_inference_with_data(const void* input_data, size_t input_size);
-    bool run_inference_with_npz(const std::string& npz_path);
+    bool run_inference_from_bin(const std::string& bin_path);
     void print_top5_results();
 
     // Status

@@ -63,20 +63,11 @@ endif()
 message(STATUS "Using TVM runtime: ${TVM_RUNTIME_LIB}")
 
 # Find json-c library for JSON pipeline configuration
-find_library(JSON_C_LIB json-c REQUIRED)
-find_path(JSON_C_INCLUDE_DIR json-c/json.h
-    PATHS /usr/include /usr/local/include
-    REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JSON_C REQUIRED json-c)
 
 # Add json-c include directory
-target_include_directories(rpmsg_inference_example PRIVATE ${JSON_C_INCLUDE_DIR})
-
-# Add cnpy for NPZ loading
-set(CNPY_DIR "${TVM_ROOT}/3rdparty/cnpy")
-include_directories(${CNPY_DIR})
-add_library(cnpy STATIC ${CNPY_DIR}/cnpy.cpp)
-target_include_directories(cnpy PRIVATE ${CNPY_DIR})
-target_include_directories(rpmsg_inference_example PRIVATE ${CNPY_DIR})
+target_include_directories(rpmsg_inference_example PRIVATE ${JSON_C_INCLUDE_DIRS})
 
 # Find readline library for interactive mode with command line editing
 find_library(READLINE_LIB readline REQUIRED)
@@ -89,15 +80,26 @@ find_library(ALSA_LIB asound REQUIRED)
 target_link_libraries(rpmsg_inference_example
     ${TVM_RUNTIME_LIB}
     ti_rpmsg_dma
-    ${JSON_C_LIB}
+    ${JSON_C_LIBRARIES}
     ${READLINE_LIB}
     ${SNDFILE_LIB}
     ${ALSA_LIB}
-    cnpy
-    z
     pthread
     dl
 )
 
 # Install target
 install(TARGETS rpmsg_inference_example DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Install JSON pipeline configuration files to /usr/share/tvm_inference/json/
+install(FILES
+${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_stft_istft.json
+${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_tvm_inference.json
+${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_audio_enhancement.json
+DESTINATION /usr/share/tvm_inference/json)
+
+# Install input files to /usr/share/tvm_inference/input/
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/input_audio/input_audio.wav
+    ${CMAKE_CURRENT_SOURCE_DIR}/artifacts_bin/gcrn_fixed_input.bin
+    DESTINATION /usr/share/tvm_inference/input)
