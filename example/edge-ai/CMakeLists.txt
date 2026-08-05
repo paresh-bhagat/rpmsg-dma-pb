@@ -51,7 +51,7 @@ target_compile_definitions(rpmsg_inference_example PRIVATE
 # Find TVM runtime library
 if(NOT TVM_RUNTIME_LIB)
     # Use the ARM64 build (for local builds)
-    set(TVM_ARM64_BUILD_PATH "${TVM_ROOT}/build_aarch64_py314")
+    set(TVM_ARM64_BUILD_PATH "${TVM_ROOT}")
     set(TVM_RUNTIME_LIB "${TVM_ARM64_BUILD_PATH}/libtvm_runtime.so")
 endif()
 

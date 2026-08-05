@@ -30,6 +30,7 @@ char dma_pool_name[] = "linux,cma";
 #define TVM_INPUT_ADDR     0xa3000000UL   // STFT output → TVM input
 #define TVM_OUTPUT_ADDR    0xabc00000UL   // TVM output → ISTFT input
 
+
 // Pipeline JSON file paths for --mode command-line invocation
 static const char* PIPELINE_FILE_STFT_ISTFT = "json_files/pipeline_stft_istft.json";
 static const char* PIPELINE_FILE_TVM_ONLY = "json_files/pipeline_tvm_inference.json";
@@ -776,23 +777,30 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
         return CommandResult::ERROR;
     }
 
-    // STFT/ISTFT configuration from TI model_config.h (DCCRN model)
-    const size_t BATCH_N = 30;                 // Number of windows/chunks to process
-    const size_t STFT_INPUT_SAMPLES = 256;     // Audio samples per window (STFT_HOP_SIZE)
-    const size_t STFT_NUM_BINS = 257;          // FFT bins
-    const size_t STFT_MODEL_ELEMS = 514;       // 2 × STFT_NUM_BINS (real + imaginary)
+    // GCRN signal processing parameters (from model_config.h)
+    const size_t GCRN_HOP_SIZE    = 160;  // STFT_INPUT_SAMPLES
+    const size_t GCRN_MODEL_ELEMS = 322;  // STFT_NUM_BINS*2 = 161*2
+    const size_t GCRN_BATCH_N     = 64;   // max frames per STFT/ISTFT call
+    const size_t GCRN_PAD_FRAMES  = 17;   // padding frames to reach 401 per TVM window
+    // TVM window = 6×64 + 17 = 401 frames, fixed input shape [1,2,401,161]
+    const size_t GCRN_TOTAL_FRAMES   = 6 * GCRN_BATCH_N + GCRN_PAD_FRAMES; // 401
+    const size_t GCRN_NUM_BATCHES    = 7; // 6 full + 1 pad (kept for logging)
 
-    size_t total_audio_samples = BATCH_N * STFT_INPUT_SAMPLES;  // 30 × 100 = 3000 samples
-    size_t audio_chunk_bytes = total_audio_samples * sizeof(int16_t);  // 6000 bytes
-    size_t spectral_data_bytes = BATCH_N * STFT_MODEL_ELEMS * sizeof(float);  // 30 × 514 × 4 = 61680 bytes
+    // Buffer sizes
+    size_t audio_batch_bytes    = GCRN_BATCH_N      * GCRN_HOP_SIZE    * sizeof(int16_t); // 20480 bytes
+    size_t spectral_total_bytes = GCRN_TOTAL_FRAMES  * GCRN_MODEL_ELEMS * sizeof(float);   // 516488 bytes
 
-#ifdef DEBUG
-    std::cout << "[App] STFT configuration:" << std::endl;
-    std::cout << "[App] Batch size (BATCH_N): " << BATCH_N << " windows" << std::endl;
-    std::cout << "[App] Samples per window: " << STFT_INPUT_SAMPLES << " samples" << std::endl;
-    std::cout << "[App] Total audio input: " << total_audio_samples << " samples (" << audio_chunk_bytes << " bytes)" << std::endl;
-    std::cout << "[App] Spectral data: " << STFT_MODEL_ELEMS << " elements: " << BATCH_N << " = " << spectral_data_bytes << " bytes" << std::endl;
-#endif
+    // Detect if pipeline has a TVM stage
+    bool has_tvm_stage = false;
+    for (const auto& stage : state_.pipeline_config.stages) {
+        if (stage.service == "tvm") { has_tvm_stage = true; break; }
+    }
+
+    std::cout << "[App] GCRN configuration:" << std::endl;
+    std::cout << "[App]   HOP=" << GCRN_HOP_SIZE << " MODEL_ELEMS=" << GCRN_MODEL_ELEMS
+              << " BATCH_N=" << GCRN_BATCH_N << " TOTAL_FRAMES=" << GCRN_TOTAL_FRAMES << std::endl;
+    std::cout << "[App]   Spectral buffer: " << spectral_total_bytes << " bytes (401 frames)" << std::endl;
+    std::cout << "[App]   TVM stage: " << (has_tvm_stage ? "enabled" : "bypassed") << std::endl;
 
     // Initialize generic client
     if (!generic_client_->initialize()) {
@@ -800,324 +808,292 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
         return CommandResult::ERROR;
     }
 
-    // Check if pipeline has TVM stage
-    bool has_tvm_stage = false;
-    for (const auto& stage : state_.pipeline_config.stages) {
-        if (stage.service == "tvm") {
-            has_tvm_stage = true;
-            break;
-        }
-    }
+    // buf1: STFT audio input (one batch), buf4: ISTFT audio output (one batch)
+    // buf2: spectral buffer (STFT out / ISTFT in) — only when TVM is NOT in pipeline
+    //       when TVM IS in pipeline, fixed DSP addresses are used instead
+    struct dma_buf_params dma_buf1, dma_buf2, dma_buf4;
+    bool dma_buf2_allocated = false;
 
-    // Initialize TVM client with artifacts only if pipeline has TVM stage
-    if (has_tvm_stage && state_.tvm_artifacts_configured && !tvm_client_->is_initialized()) {
-        if (!tvm_client_->initialize(state_.tvm_artifacts_paths[0])) {
-            std::cout << "[App] Error: Failed to initialize TVM client" << std::endl;
-            std::cout << "[App] WARNING: Continuing without TVM" << std::endl;
-        }
-    }
-
-    // Allocate DMA buffers for the pipeline stages (STFT/ISTFT)
-    struct dma_buf_params dma_buf1, dma_buf2, dma_buf3;
-#ifdef DEBUG
-    std::cout << "[App] Allocating DMA buffers from linux,cma heap..." << std::endl;
-    std::cout << "[App] Using fixed TVM memory addresses:" << std::endl;
-    std::cout << "[App]   TVM_INPUT_ADDR:  0x" << std::hex << TVM_INPUT_ADDR << std::dec << std::endl;
-    std::cout << "[App]   TVM_OUTPUT_ADDR: 0x" << std::hex << TVM_OUTPUT_ADDR << std::dec << std::endl;
-#endif
-    // DMA Buffer 1: STFT input (audio samples)
     int ret1 = dmabuf_heap_init((char*)"linux,cma",
-                                audio_chunk_bytes, (char*)"/dev/remoteproc0", &dma_buf1);
+                                audio_batch_bytes, (char*)"/dev/remoteproc0", &dma_buf1);
     if (ret1 != 0) {
         std::cout << "[App] Error: Failed to allocate DMA buffer 1 (STFT input)" << std::endl;
         return CommandResult::ERROR;
     }
 
-    // DMA Buffer 2: STFT output / ISTFT input (spectral data - larger!)
-    int ret2 = dmabuf_heap_init((char*)"linux,cma",
-                                spectral_data_bytes, (char*)"/dev/remoteproc0", &dma_buf2);
-    if (ret2 != 0) {
-        std::cout << "[App] Error: Failed to allocate DMA buffer 2 (STFT output / ISTFT input)" << std::endl;
+    if (!has_tvm_stage) {
+        int ret2 = dmabuf_heap_init((char*)"linux,cma",
+                                    spectral_total_bytes, (char*)"/dev/remoteproc0", &dma_buf2);
+        if (ret2 != 0) {
+            std::cout << "[App] Error: Failed to allocate DMA buffer 2 (spectral)" << std::endl;
+            dmabuf_heap_destroy(&dma_buf1);
+            return CommandResult::ERROR;
+        }
+        dma_buf2_allocated = true;
+    }
+
+    // Full output buffer for all 7 batches (6×64 + 1×17 frames) so each writes to its own offset
+    size_t audio_total_bytes = GCRN_TOTAL_FRAMES * GCRN_HOP_SIZE * sizeof(int16_t); // 128320 bytes
+    int ret4 = dmabuf_heap_init((char*)"linux,cma",
+                                audio_total_bytes, (char*)"/dev/remoteproc0", &dma_buf4);
+    if (ret4 != 0) {
+        std::cout << "[App] Error: Failed to allocate DMA buffer 4 (ISTFT output)" << std::endl;
         dmabuf_heap_destroy(&dma_buf1);
+        if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
         return CommandResult::ERROR;
     }
 
-    // DMA Buffer 3: ISTFT output (audio samples)
-    int ret3 = dmabuf_heap_init((char*)"linux,cma",
-                                audio_chunk_bytes, (char*)"/dev/remoteproc0", &dma_buf3);
-    if (ret3 != 0) {
-        std::cout << "[App] Error: Failed to allocate DMA buffer 3 (ISTFT output)" << std::endl;
+    std::cout << "[App] DMA buffers:" << std::endl;
+    std::cout << "[App]   buf1 (STFT audio in):   phys=0x" << std::hex << dma_buf1.phys_addr
+              << std::dec << " size=" << dma_buf1.size << std::endl;
+    if (has_tvm_stage) {
+        std::cout << "[App]   STFT out/TVM in:        phys=0x" << std::hex << TVM_INPUT_ADDR
+                  << std::dec << " (fixed)" << std::endl;
+        std::cout << "[App]   TVM out/ISTFT in:       phys=0x" << std::hex << TVM_OUTPUT_ADDR
+                  << std::dec << " (fixed)" << std::endl;
+    } else {
+        std::cout << "[App]   buf2 (STFT out/ISTFT in): phys=0x" << std::hex << dma_buf2.phys_addr
+                  << std::dec << " size=" << dma_buf2.size << std::endl;
+    }
+    std::cout << "[App]   buf4 (ISTFT audio out): phys=0x" << std::hex << dma_buf4.phys_addr
+              << std::dec << " size=" << dma_buf4.size << std::endl;
+
+    // Find STFT and ISTFT stages once
+    const PipelineStage* stft_stage_ptr  = nullptr;
+    const PipelineStage* istft_stage_ptr = nullptr;
+    for (const auto& stage : state_.pipeline_config.stages) {
+        if (stage.message_type == "C7X_MSG_STFT_ANALYZE")         stft_stage_ptr  = &stage;
+        else if (stage.message_type == "C7X_MSG_ISTFT_SYNTHESIZE") istft_stage_ptr = &stage;
+    }
+    if (!stft_stage_ptr || !istft_stage_ptr) {
+        std::cout << "[App] Error: Audio pipeline requires STFT and ISTFT stages" << std::endl;
         dmabuf_heap_destroy(&dma_buf1);
-        dmabuf_heap_destroy(&dma_buf2);
+        if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+        dmabuf_heap_destroy(&dma_buf4);
         return CommandResult::ERROR;
     }
-#ifdef DEBUG
-    std::cout << "[App] DMA buffer allocation successful:" << std::endl;
-    std::cout << "[App]   DMA Buffer 1 (STFT input):  phys=0x" << std::hex << dma_buf1.phys_addr
-              << ", virt=" << dma_buf1.kern_addr << ", size=" << std::dec << dma_buf1.size << std::endl;
-    std::cout << "[App]   DMA Buffer 2 (STFT→ISTFT):  phys=0x" << std::hex << dma_buf2.phys_addr
-              << ", virt=" << dma_buf2.kern_addr << ", size=" << std::dec << dma_buf2.size << std::endl;
-    std::cout << "[App]   DMA Buffer 3 (ISTFT output): phys=0x" << std::hex << dma_buf3.phys_addr
-              << ", virt=" << dma_buf3.kern_addr << ", size=" << std::dec << dma_buf3.size << std::endl;
-#endif
 
-    // Calculate how many full batches we can process
-    size_t total_samples = audio_data.size();
-    size_t num_full_batches = total_samples / total_audio_samples;
-    size_t remainder_samples = total_samples % total_audio_samples;
-    size_t samples_to_process = num_full_batches * total_audio_samples;
+    // Each full chunk consumes exactly 401 frames.
+    // Remaining frames < 401 are zero-padded to 401 and processed as a partial chunk;
+    // only the real frames are kept from its ISTFT output.
+    size_t total_frames     = audio_data.size() / GCRN_HOP_SIZE;
+    size_t num_full_chunks  = total_frames / GCRN_TOTAL_FRAMES;
+    size_t partial_frames   = total_frames % GCRN_TOTAL_FRAMES;
+    size_t num_chunks       = num_full_chunks + (partial_frames > 0 ? 1 : 0);
 
-#ifdef DEBUG
-    std::cout << "[App] Sequential processing of " << total_samples << " samples" << std::endl;
-    std::cout << "[App] Batch configuration: " << BATCH_N << " windows per batch, "
-              << total_audio_samples << " samples per batch" << std::endl;
-    std::cout << "[App] Total batches to process: " << num_full_batches << std::endl;
-    if (remainder_samples > 0) {
-        std::cout << "[App] Ignoring " << remainder_samples << " remainder samples (not a full batch)" << std::endl;
-    }
-#endif
+    std::cout << "[App] Full file processing:" << std::endl;
+    std::cout << "[App]   Total frames: " << total_frames
+              << " | Full chunks: " << num_full_chunks
+              << " | Partial chunk: " << partial_frames << " real frames"
+              << " (zero-padded to 401)" << std::endl;
 
-    // Collect all processed audio chunks for final output file
     std::vector<int16_t> processed_audio_data;
-    processed_audio_data.reserve(samples_to_process);
+    processed_audio_data.reserve(total_frames * GCRN_HOP_SIZE);
 
     stream_open();
 
-    // Process audio in batches of 30 windows
-    for (size_t batch_idx = 0; batch_idx < num_full_batches; batch_idx++) {
-        size_t batch_start = batch_idx * total_audio_samples;
-        size_t batch_end = batch_start + total_audio_samples;
-        size_t actual_samples = total_audio_samples;
-        size_t actual_bytes = actual_samples * sizeof(int16_t);
+    uint64_t stft_out_base = has_tvm_stage ? TVM_INPUT_ADDR : dma_buf2.phys_addr;
+    uint64_t istft_src_base = has_tvm_stage ? TVM_OUTPUT_ADDR : dma_buf2.phys_addr;
 
-	std::cout << "\n[App] Processing batch " << (batch_idx + 1) << "/" << num_full_batches
-                  << " (" << BATCH_N << " windows"
-                  << ", samples " << batch_start << "-" << batch_end
-                  << ", " << actual_bytes << " bytes)" << std::endl;
-
-        // === THREE-STAGE SEQUENTIAL PIPELINE ===
-
-#ifdef DEBUG
-        // Step 1: Copy entire batch TO DMA Buffer 1 (STFT input)
-        std::cout << "[App] Step 1: Copying entire batch to DMA Buffer 1 (STFT input)..." << std::endl;
-#endif
-        // Calculate input RMS for verification
-        float input_sum = 0.0f;
-        for (size_t i = batch_start; i < batch_start + actual_samples; i++) {
-            float sample = (float)audio_data[i] / 32768.0f;
-            input_sum += sample * sample;
-        }
-        float input_rms = sqrtf(input_sum / actual_samples);
-        //std::cout << "[App] Input batch RMS: " << input_rms << std::endl;
-
-        dmabuf_sync(dma_buf1.dma_buf_fd, DMA_BUF_SYNC_START);
-        memcpy(dma_buf1.kern_addr, &audio_data[batch_start], actual_bytes);
-	stream_frame(0, dma_buf1.kern_addr, actual_bytes);
-#ifdef DEBUG
-        // Debug: Show STFT input samples from DMA Buffer 1
-        int16_t* input_samples = (int16_t*)dma_buf1.kern_addr;
-        std::cout << "[App] DEBUG: STFT INPUT (DMA Buf 1) first 8 samples: ";
-        for (int i = 0; i < 8; i++) {
-            std::cout << input_samples[i] << " ";
-        }
-        std::cout << std::endl;
-#endif
-        dmabuf_sync(dma_buf1.dma_buf_fd, DMA_BUF_SYNC_END);
-
-        // Find stage configurations by message type
-        const PipelineStage* stft_stage_ptr = nullptr;
-        const PipelineStage* istft_stage_ptr = nullptr;
-        for (const auto& stage : state_.pipeline_config.stages) {
-            if (stage.message_type == "C7X_MSG_STFT_ANALYZE") stft_stage_ptr = &stage;
-            else if (stage.message_type == "C7X_MSG_ISTFT_SYNTHESIZE") istft_stage_ptr = &stage;
-        }
-        if (!stft_stage_ptr || !istft_stage_ptr) {
-            std::cout << "[App] Error: Audio pipeline requires STFT and ISTFT stages" << std::endl;
+    // Initialize TVM once before the chunk loop
+    if (has_tvm_stage && state_.tvm_artifacts_configured && !tvm_client_->is_initialized()) {
+        if (!tvm_client_->initialize(state_.tvm_artifacts_paths[0])) {
+            std::cout << "[App] Error: Failed to initialize TVM client" << std::endl;
             dmabuf_heap_destroy(&dma_buf1);
-            dmabuf_heap_destroy(&dma_buf2);
-            dmabuf_heap_destroy(&dma_buf3);
+            if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+            dmabuf_heap_destroy(&dma_buf4);
+            stream_close();
             return CommandResult::ERROR;
         }
-        const auto& stft_stage = *stft_stage_ptr;
-        const auto& istft_stage = *istft_stage_ptr;
+        tvm_client_->set_input_shape({1, 2, 401, 161});
+        tvm_client_->set_input_name("input");
+        std::cout << "[App] TVM initialized, input shape [1,2,401,161]" << std::endl;
+    }
 
-        // === THREE-STAGE PIPELINE: STFT → TVM → ISTFT ===
+    auto t_total_start = std::chrono::high_resolution_clock::now();
 
-        // Step 2: STFT analyze (DMA Buffer 1 → DMA Buffer 2)
-        //std::cout << "[App] Step 2: STFT analyze (DMA Buffer 1 → DMA Buffer 2)..." << std::endl;
+    for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
+        size_t chunk_frame_offset = chunk_idx * GCRN_TOTAL_FRAMES;
+        size_t num_batches_this_chunk = 7;
+        // For the partial chunk, how many real frames it contains (0 means full chunk)
+        size_t real_frames_this_chunk = (chunk_idx == num_full_chunks && partial_frames > 0)
+                                        ? partial_frames : GCRN_TOTAL_FRAMES;
 
-        // Update STFT parameters to output to DMA Buffer 2
-        auto stft_params = stft_stage.parameters;
-        char input_addr_str[32], output_addr_str[32];
-        snprintf(input_addr_str, sizeof(input_addr_str), "0x%lx", dma_buf1.phys_addr);
-        snprintf(output_addr_str, sizeof(output_addr_str), "0x%lx", dma_buf2.phys_addr);
-        stft_params["input_buffer"] = input_addr_str;
-        stft_params["output_buffer"] = output_addr_str;
+        auto t_chunk_start = std::chrono::high_resolution_clock::now();
 
-        // Process entire batch: 30 windows × 514 elements × 4 bytes = 61680 bytes
-        auto stft_result = generic_client_->process(
-            stft_stage.message_type,
-            nullptr, actual_bytes, nullptr, spectral_data_bytes,
-            stft_params
-        );
+        // =====================================================
+        // Phase 1: STFT
+        // =====================================================
+        auto t_stft_start = std::chrono::high_resolution_clock::now();
+        for (size_t batch_idx = 0; batch_idx < num_batches_this_chunk; batch_idx++) {
+            size_t frames_this_batch  = (batch_idx < 6) ? GCRN_BATCH_N : GCRN_PAD_FRAMES;
+            size_t samples_this_batch = frames_this_batch * GCRN_HOP_SIZE;
+            size_t audio_offset       = (chunk_frame_offset + batch_idx * GCRN_BATCH_N) * GCRN_HOP_SIZE;
+            size_t audio_bytes        = samples_this_batch * sizeof(int16_t);
+            uint64_t spectral_offset  = batch_idx * GCRN_BATCH_N * GCRN_MODEL_ELEMS * sizeof(float);
 
-        if (!stft_result.success) {
-            std::cout << "[App] Error: STFT analyze failed: " << stft_result.error_message << std::endl;
-            return CommandResult::ERROR;
-        }
-#ifdef DEBUG
-        std::cout << "[App] STFT analyze success: input=" << stft_result.input_size
-                  << " bytes, output=" << stft_result.output_size << " bytes" << std::endl;
-
-        // Step 3: Verify STFT output in DMA Buffer 2
-        std::cout << "[App] Step 3: Verifying STFT output in DMA Buffer 2..." << std::endl;
-#endif
-        dmabuf_sync(dma_buf2.dma_buf_fd, DMA_BUF_SYNC_START);
-
-#ifdef DEBUG
-        // Debug: Read spectral data from STFT output (float values)
-        float* spectral_data = (float*)dma_buf2.kern_addr;
-        std::cout << "[App] DEBUG: STFT OUTPUT (DMA Buf 2) first 8 spectral values: ";
-        for (int i = 0; i < 8; i++) {
-            printf("%.6f ", spectral_data[i]);
-        }
-        std::cout << std::endl;
-#endif
-        dmabuf_sync(dma_buf2.dma_buf_fd, DMA_BUF_SYNC_END);
-#ifdef DEBUG
-        std::cout << "[App]   STFT processing complete for batch" << std::endl;
-
-        // Step 4: ISTFT synthesize (no TVM in STFT-only pipeline)
-        std::cout << "[App] Step 4: ISTFT synthesize..." << std::endl;
-#endif
-        // Update ISTFT parameters
-        auto istft_params = istft_stage.parameters;
-        snprintf(input_addr_str, sizeof(input_addr_str), "0x%lx", dma_buf2.phys_addr);
-        snprintf(output_addr_str, sizeof(output_addr_str), "0x%lx", dma_buf3.phys_addr);
-        istft_params["input_buffer"] = input_addr_str;
-        istft_params["output_buffer"] = output_addr_str;
-
-        // Process entire batch: input 61680 bytes, output 3000 samples (6000 bytes)
-        auto istft_result = generic_client_->process(
-            istft_stage.message_type,
-            nullptr, spectral_data_bytes, nullptr, actual_bytes,
-            istft_params
-        );
-
-        if (!istft_result.success) {
-            std::cout << "[App] Error: ISTFT synthesize failed: " << istft_result.error_message << std::endl;
-            return CommandResult::ERROR;
-        }
-#ifdef DEBUG
-        std::cout << "[App] ISTFT synthesize success: input=" << istft_result.input_size
-                  << " bytes, output=" << istft_result.output_size << " bytes" << std::endl;
-
-        // Step 5: Verify final output in DMA Buffer 3
-        std::cout << "[App] Step 5: Verifying batch output in DMA Buffer 3..." << std::endl;
-#endif
-        // Invalidate cache to ensure we read fresh data from firmware
-        dmabuf_sync(dma_buf3.dma_buf_fd, DMA_BUF_SYNC_START);
-
-        // Copy entire batch output
-        std::vector<int16_t> final_output(total_audio_samples);
-        memcpy(final_output.data(), dma_buf3.kern_addr, actual_bytes);
-        dmabuf_sync(dma_buf3.dma_buf_fd, DMA_BUF_SYNC_END);
-	stream_frame(1,  dma_buf3.kern_addr, actual_bytes);
-
-#ifdef DEBUG
-        // Per-chunk verification (30 chunks × 100 samples)
-        std::cout << "[App] Per-chunk verification:" << std::endl;
-        std::cout << "[App]   Chunk | Input RMS | Output RMS | Error RMS | Input Samples (first 5)      | Output Samples (first 5)" << std::endl;
-        std::cout << "[App]   ------+-----------+------------+-----------+-------------------------------+-------------------------------" << std::endl;
-#endif
-        // Latency compensation: DCCRN has 7-chunk delay (700 samples)
-        const size_t LATENCY_CHUNKS = 1;
-        const size_t LATENCY_SAMPLES = LATENCY_CHUNKS * STFT_INPUT_SAMPLES;  // 700 samples
-
-        float total_error_sum = 0.0f;
-        for (size_t chunk = 0; chunk < BATCH_N; chunk++) {
-            size_t chunk_offset = chunk * STFT_INPUT_SAMPLES;
-
-            // Calculate input RMS for this chunk
-            float chunk_input_sum = 0.0f;
-            for (size_t i = 0; i < STFT_INPUT_SAMPLES; i++) {
-                float sample = (float)audio_data[batch_start + chunk_offset + i] / 32768.0f;
-                chunk_input_sum += sample * sample;
+            dmabuf_sync(dma_buf1.dma_buf_fd, DMA_BUF_SYNC_START);
+            memset(dma_buf1.kern_addr, 0, audio_batch_bytes);
+            if (audio_offset < audio_data.size()) {
+                size_t avail = std::min(samples_this_batch, audio_data.size() - audio_offset);
+                memcpy(dma_buf1.kern_addr, &audio_data[audio_offset], avail * sizeof(int16_t));
             }
-            float chunk_input_rms = sqrtf(chunk_input_sum / STFT_INPUT_SAMPLES);
+            dmabuf_sync(dma_buf1.dma_buf_fd, DMA_BUF_SYNC_END);
+            stream_frame(0, dma_buf1.kern_addr, audio_bytes);
 
-            // Calculate output RMS for this chunk
-            float chunk_output_sum = 0.0f;
-            for (size_t i = 0; i < STFT_INPUT_SAMPLES; i++) {
-                float sample = (float)final_output[chunk_offset + i] / 32768.0f;
-                chunk_output_sum += sample * sample;
+            auto params = stft_stage_ptr->parameters;
+            char in_str[32], out_str[32];
+            snprintf(in_str,  sizeof(in_str),  "0x%lx", dma_buf1.phys_addr);
+            snprintf(out_str, sizeof(out_str), "0x%lx", stft_out_base + spectral_offset);
+            params["input_buffer"]  = in_str;
+            params["output_buffer"] = out_str;
+            params["input_frame"]   = std::to_string(frames_this_batch);
+            params["output_frame"]  = std::to_string(frames_this_batch);
+
+            if (debug_)
+                std::cout << "[App]   STFT batch " << (batch_idx+1) << "/" << num_batches_this_chunk
+                          << ": " << frames_this_batch << " frames"
+                          << " in=0x" << std::hex << dma_buf1.phys_addr
+                          << " out=0x" << (stft_out_base + spectral_offset) << std::dec << std::endl;
+
+            auto r = generic_client_->process("C7X_MSG_STFT_ANALYZE",
+                                              nullptr, 0, nullptr, 0, params);
+            if (!r.success) {
+                std::cout << "[App] Error: STFT batch " << (batch_idx+1)
+                          << " failed: " << r.error_message << std::endl;
+                dmabuf_heap_destroy(&dma_buf1);
+                if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf4);
+                stream_close();
+                return CommandResult::ERROR;
             }
-            float chunk_output_rms = sqrtf(chunk_output_sum / STFT_INPUT_SAMPLES);
+        }
+        double t_stft_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - t_stft_start).count() / 1000.0;
 
-            // Calculate error with latency compensation
-            float chunk_error_sum = 0.0f;
-            if (chunk + LATENCY_CHUNKS < BATCH_N) {
-                for (size_t i = 0; i < STFT_INPUT_SAMPLES; i++) {
-                    size_t input_idx = batch_start + chunk_offset + i;
-                    size_t output_idx = chunk_offset + i + LATENCY_SAMPLES;
-                    int16_t error = abs(audio_data[input_idx] - final_output[output_idx]);
-                    chunk_error_sum += (float)(error * error);
+        // =====================================================
+        // Phase 2: TVM
+        // =====================================================
+        double t_tvm_ms = 0.0;
+        auto t_tvm_start = std::chrono::high_resolution_clock::now();
+        if (has_tvm_stage && tvm_client_->is_initialized()) {
+            if (!tvm_client_->run_inference()) {
+                std::cout << "[App] Error: TVM inference failed" << std::endl;
+                dmabuf_heap_destroy(&dma_buf1);
+                if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf4);
+                stream_close();
+                return CommandResult::ERROR;
+            }
+            t_tvm_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::high_resolution_clock::now() - t_tvm_start).count() / 1000.0;
+        }
+
+        // =====================================================
+        // Phase 3: ISTFT
+        // =====================================================
+        auto t_istft_start = std::chrono::high_resolution_clock::now();
+        size_t real_samples_remaining = real_frames_this_chunk * GCRN_HOP_SIZE;
+        for (size_t batch_idx = 0; batch_idx < num_batches_this_chunk; batch_idx++) {
+            size_t frames_this_batch  = (batch_idx < 6) ? GCRN_BATCH_N : GCRN_PAD_FRAMES;
+            size_t samples_this_batch = frames_this_batch * GCRN_HOP_SIZE;
+            size_t audio_offset       = (chunk_frame_offset + batch_idx * GCRN_BATCH_N) * GCRN_HOP_SIZE;
+            size_t audio_bytes        = samples_this_batch * sizeof(int16_t);
+            uint64_t spectral_offset  = batch_idx * GCRN_BATCH_N * GCRN_MODEL_ELEMS * sizeof(float);
+            uint64_t audio_out_offset = batch_idx * GCRN_BATCH_N * GCRN_HOP_SIZE * sizeof(int16_t);
+
+            auto params = istft_stage_ptr->parameters;
+            char in_str[32], out_str[32];
+            snprintf(in_str,  sizeof(in_str),  "0x%lx", istft_src_base + spectral_offset);
+            snprintf(out_str, sizeof(out_str), "0x%lx", dma_buf4.phys_addr + audio_out_offset);
+            params["input_buffer"]  = in_str;
+            params["output_buffer"] = out_str;
+            params["input_frame"]   = std::to_string(frames_this_batch);
+            params["output_frame"]  = std::to_string(frames_this_batch);
+
+            if (debug_)
+                std::cout << "[App]   ISTFT batch " << (batch_idx+1) << "/" << num_batches_this_chunk
+                          << ": " << frames_this_batch << " frames"
+                          << " in=0x" << std::hex << (istft_src_base + spectral_offset)
+                          << " out=0x" << (dma_buf4.phys_addr + audio_out_offset) << std::dec << std::endl;
+
+            auto r = generic_client_->process("C7X_MSG_ISTFT_SYNTHESIZE",
+                                              nullptr, 0, nullptr, 0, params);
+            if (!r.success) {
+                std::cout << "[App] Error: ISTFT batch " << (batch_idx+1)
+                          << " failed: " << r.error_message << std::endl;
+                dmabuf_heap_destroy(&dma_buf1);
+                if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf4);
+                stream_close();
+                return CommandResult::ERROR;
+            }
+
+            dmabuf_sync(dma_buf4.dma_buf_fd, DMA_BUF_SYNC_START);
+            int16_t* out_ptr = (int16_t*)dma_buf4.kern_addr + batch_idx * GCRN_BATCH_N * GCRN_HOP_SIZE;
+
+            if (debug_) {
+                std::cout << "[App]   Frame | InRMS  OutRMS | In[0..4]              | Out[0..4]" << std::endl;
+                for (size_t f = 0; f < std::min((size_t)4, frames_this_batch); f++) {
+                    size_t in_off  = audio_offset + f * GCRN_HOP_SIZE;
+                    size_t out_off = f * GCRN_HOP_SIZE;
+                    float in_sum = 0.0f, out_sum = 0.0f;
+                    for (size_t i = 0; i < GCRN_HOP_SIZE; i++) {
+                        float s = (float)audio_data[in_off + i] / 32768.0f; in_sum  += s*s;
+                        float o = (float)out_ptr[out_off + i]   / 32768.0f; out_sum += o*o;
+                    }
+                    std::cout << "[App]   " << std::setw(5) << (chunk_frame_offset + batch_idx*GCRN_BATCH_N + f + 1)
+                              << " | " << std::fixed << std::setprecision(4)
+                              << sqrtf(in_sum/GCRN_HOP_SIZE) << "  " << sqrtf(out_sum/GCRN_HOP_SIZE)
+                              << " | In:";
+                    for (size_t i = 0; i < 5; i++)
+                        std::cout << std::setw(6) << audio_data[in_off + i] << (i<4?",":"");
+                    std::cout << " | Out:";
+                    for (size_t i = 0; i < 5; i++)
+                        std::cout << std::setw(6) << out_ptr[out_off + i] << (i<4?",":"");
+                    std::cout << std::endl;
                 }
             }
-            float chunk_error_rms = sqrtf(chunk_error_sum / STFT_INPUT_SAMPLES);
 
-            total_error_sum += chunk_error_sum;
-#ifdef DEBUG
-            // Print all 30 chunks with RMS
-            std::cout << "[App]   " << std::setw(5) << (chunk + 1)
-                      << " | " << std::fixed << std::setprecision(4) << std::setw(9) << chunk_input_rms
-                      << " | " << std::setw(10) << chunk_output_rms
-                      << " | " << std::setw(9) << chunk_error_rms;
+            size_t samples_to_collect = std::min(samples_this_batch, real_samples_remaining);
+            for (size_t i = 0; i < samples_to_collect; i++)
+                processed_audio_data.push_back(out_ptr[i]);
+            real_samples_remaining -= samples_to_collect;
 
-            // Print first 5 samples for this chunk (input and output) on the same line
-            std::cout << " | In[0-4]: ";
-            for (size_t i = 0; i < 5 && i < STFT_INPUT_SAMPLES; i++) {
-                std::cout << std::setw(6) << audio_data[batch_start + chunk_offset + i];
-                if (i < 4) std::cout << ",";
-            }
-            std::cout << " | Out[0-4]: ";
-            for (size_t i = 0; i < 5 && i < STFT_INPUT_SAMPLES; i++) {
-                std::cout << std::setw(6) << final_output[chunk_offset + i];
-                if (i < 4) std::cout << ",";
-            }
-            std::cout << std::endl;
-#endif
+            dmabuf_sync(dma_buf4.dma_buf_fd, DMA_BUF_SYNC_END);
+            stream_frame(1, out_ptr, samples_to_collect * sizeof(int16_t));
         }
+        double t_istft_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - t_istft_start).count() / 1000.0;
 
-        float total_error_rms = sqrtf(total_error_sum / (STFT_INPUT_SAMPLES * (BATCH_N - LATENCY_CHUNKS)));
-        std::cout << "[App] Overall error RMS (with 700-sample latency compensation): " << total_error_rms << std::endl;
+        double t_chunk_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - t_chunk_start).count() / 1000.0;
 
-        // Collect processed batch for final output file
-        for (size_t i = 0; i < total_audio_samples; i++) {
-            processed_audio_data.push_back(final_output[i]);
-        }
+        std::cout << "[App] Chunk " << (chunk_idx+1) << "/" << num_chunks
+                  << " [" << real_frames_this_chunk << " real frames"
+                  << (real_frames_this_chunk < GCRN_TOTAL_FRAMES ? " + zero-pad" : "") << "]"
+                  << " | STFT=" << std::fixed << std::setprecision(1) << t_stft_ms << "ms"
+                  << " TVM=" << t_tvm_ms << "ms"
+                  << " ISTFT=" << t_istft_ms << "ms"
+                  << " total=" << t_chunk_ms << "ms" << std::endl;
     }
 
-    std::cout << "\n[App] Batch processing complete:" << std::endl;
-    std::cout << "[App]   Processed " << num_full_batches << " batches" << std::endl;
-    std::cout << "[App]   Total samples processed: " << processed_audio_data.size() << std::endl;
-    std::cout << "[App]   Samples ignored: " << remainder_samples << std::endl;
+    double t_total_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now() - t_total_start).count() / 1000.0;
 
-    // Save processed audio to file for verification
+    std::cout << "[App] All chunks done | total=" << std::fixed << std::setprecision(1)
+              << t_total_ms << "ms | " << (processed_audio_data.size() / 160) << " output GCRN frames ("
+              << processed_audio_data.size() << " samples)" << std::endl;
+
     std::string output_filename = "processed_output.wav";
-    //std::cout << "[App] Saving processed audio to: " << output_filename << std::endl;
+    if (saveAudioFile(output_filename, processed_audio_data))
+        std::cout << "[App] Saved to " << output_filename << std::endl;
+    else
+        std::cout << "[App] ERROR: Failed to save output file" << std::endl;
 
-    if (saveAudioFile(output_filename, processed_audio_data)) {
-        std::cout << "[App]  Successfully saved " << processed_audio_data.size() << " samples to " << output_filename << std::endl;
-    } else {
-        std::cout << "[App]  ERROR: Failed to save processed audio file" << std::endl;
-    }
-
-    // Cleanup DMA buffers
-    std::cout << "[App] Cleaning up DMA buffers..." << std::endl;
     dmabuf_heap_destroy(&dma_buf1);
-    dmabuf_heap_destroy(&dma_buf2);
-    dmabuf_heap_destroy(&dma_buf3);
+    if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+    dmabuf_heap_destroy(&dma_buf4);
     stream_close();
 
     return CommandResult::SUCCESS;
@@ -1147,7 +1123,8 @@ bool PipelineManager::loadAudioFile(const std::string& filename, std::vector<int
         std::cout << "[App] Warning: Audio sample rate is " << sfinfo.samplerate << "Hz, expected 16kHz" << std::endl;
     }
 
-    std::cout << "[App] Audio file info: " << sfinfo.frames << " frames, "
+    std::cout << "[App] Audio file info: " << (sfinfo.frames / 160) << " GCRN frames ("
+              << sfinfo.frames << " samples), "
               << sfinfo.samplerate << "Hz, " << sfinfo.channels << " channel(s)" << std::endl;
 
     // Read all audio data
@@ -1226,7 +1203,8 @@ bool PipelineManager::saveAudioFile(const std::string& filename, const std::vect
     }
 
     std::cout << "[App] Saving audio to: " << filename << std::endl;
-    std::cout << "[App] Output file info: " << audio_data.size() << " frames, "
+    std::cout << "[App] Output file info: " << (audio_data.size() / 160) << " GCRN frames ("
+              << audio_data.size() << " samples), "
               << sfinfo.samplerate << "Hz, " << sfinfo.channels << " channel(s)" << std::endl;
 
     // Write audio data to file
@@ -1238,7 +1216,8 @@ bool PipelineManager::saveAudioFile(const std::string& filename, const std::vect
         return false;
     }
 
-    std::cout << "[App] Successfully saved " << frames_written << " audio samples to " << filename << std::endl;
+    std::cout << "[App] Successfully saved " << (frames_written / 160) << " GCRN frames ("
+              << frames_written << " samples) to " << filename << std::endl;
     std::cout << "[App] Duration: " << (frames_written / (float)sfinfo.samplerate) << " seconds" << std::endl;
 
     return true;

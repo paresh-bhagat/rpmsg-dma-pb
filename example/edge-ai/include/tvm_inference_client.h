@@ -43,12 +43,15 @@ public:
     bool run_inference_benchmark(int num_iterations = 10);
     bool run_inference_with_data(const void* input_data, size_t input_size);
     bool run_inference_from_bin(const std::string& bin_path);
+    bool run_inference();
     void print_top5_results();
 
     // Status
     bool is_initialized() const { return initialized_; }
     const std::vector<float>& get_output() const { return output_data_; }
     const std::vector<int>& get_input_shape() const { return input_shape_; }
+    void set_input_shape(const std::vector<int>& shape) { input_shape_ = shape; }
+    void set_input_name(const std::string& name) { input_name_ = name; }
 
 private:
     // Helper methods

@@ -79,12 +79,14 @@ public:
     int run();
     int run_direct(PipelineMode mode, const std::string& input_file, const std::string& artifacts_path = "");
     int run_from_json_file(const std::string& json_file_path);
+    void set_debug(bool enable) { debug_ = enable; }
 
 private:
     std::shared_ptr<TvmInferenceClient> tvm_client_;
     std::unique_ptr<GenericTaskClient> generic_client_;
     State state_;
     bool initialized_;
+    bool debug_ = false;
     std::string app_name_;
 
     struct CommandInfo {

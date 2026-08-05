@@ -51,9 +51,10 @@ void setup_signal_handlers()
 void print_usage(const char* prog_name)
 {
     printf("Usage:\n");
-    printf("  %s                      Interactive mode (readline shell)\n", prog_name);
-    printf("  %s <pipeline.json>      Run pipeline from JSON configuration file\n", prog_name);
-    printf("  %s --help               Show this help\n", prog_name);
+    printf("  %s                          Interactive mode (readline shell)\n", prog_name);
+    printf("  %s <pipeline.json>          Run pipeline from JSON configuration file\n", prog_name);
+    printf("  %s <pipeline.json> --debug  Run with verbose per-batch debug logs\n", prog_name);
+    printf("  %s --help                   Show this help\n", prog_name);
     printf("\nJSON configuration file fields:\n");
     printf("  pipeline_id     Pipeline identifier string\n");
     printf("  description     Human-readable description\n");
@@ -77,15 +78,17 @@ int main(int argc, char *argv[])
     printf("===========================================\n\n");
 
     std::string json_file;
+    bool debug = false;
 
-    if (argc >= 2) {
-        std::string arg = argv[1];
-
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
+        } else if (arg == "--debug" || arg == "-d") {
+            debug = true;
         } else if (arg.rfind("--", 0) == 0) {
-            printf("[App] Unknown argument: %s\n", argv[1]);
+            printf("[App] Unknown argument: %s\n", argv[i]);
             print_usage(argv[0]);
             return -1;
         } else {
@@ -99,6 +102,7 @@ int main(int argc, char *argv[])
     // Create and run pipeline manager
     PipelineManager app;
     g_app = &app;
+    app.set_debug(debug);
 
     int exit_code;
     if (!json_file.empty()) {

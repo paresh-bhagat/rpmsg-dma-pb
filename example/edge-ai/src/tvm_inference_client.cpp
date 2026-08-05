@@ -164,14 +164,14 @@ bool TvmInferenceClient::prepare_input_data() {
 }
 
 void TvmInferenceClient::process_output_data() {
-    // MobileNet v2 output: (1, 1000) ImageNet classes
-    const int output_size = 1000;
-    output_data_.resize(output_size);
-
-    // Get output array from TVM
     NDArray output_array = (*get_output_)(0);
 
-    // Copy data from NDArray
+    // Compute output size from tensor shape
+    size_t output_size = 1;
+    for (int i = 0; i < output_array->ndim; i++)
+        output_size *= output_array->shape[i];
+
+    output_data_.resize(output_size);
     output_array.CopyToBytes(output_data_.data(), output_size * sizeof(float));
 }
 
@@ -243,6 +243,25 @@ bool TvmInferenceClient::run_inference_benchmark(int num_iterations) {
     }
 
     return true;
+}
+
+bool TvmInferenceClient::run_inference() {
+    if (!initialized_) {
+        std::cerr << "TVM client not initialized" << std::endl;
+        return false;
+    }
+    try {
+        auto start = std::chrono::high_resolution_clock::now();
+        (*run_)();
+        process_output_data();
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+        std::cout << "[TVM] Inference: " << std::fixed << std::setprecision(2) << ms << " ms" << std::endl;
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[TVM] Inference failed: " << e.what() << std::endl;
+        return false;
+    }
 }
 
 bool TvmInferenceClient::run_inference_with_data(const void* input_data, size_t input_size) {
