@@ -40,11 +40,8 @@ public:
     void cleanup();
 
     // Inference
-    bool run_inference_benchmark(int num_iterations = 10);
-    bool run_inference_with_data(const void* input_data, size_t input_size);
+    bool run_inference(std::vector<float>& dint_data, std::vector<float>& inter_data, size_t data_size);
     bool run_inference_from_bin(const std::string& bin_path);
-    bool run_inference();
-    void print_top5_results();
 
     // Status
     bool is_initialized() const { return initialized_; }
@@ -56,7 +53,6 @@ public:
 private:
     // Helper methods
     bool load_artifacts();
-    bool prepare_input_data();
     void process_output_data();
     std::string load_json_file(const std::string& path);
 };

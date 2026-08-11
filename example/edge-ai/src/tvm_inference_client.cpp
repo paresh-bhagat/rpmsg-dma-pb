@@ -3,7 +3,6 @@
 #include <iostream>
 #include <fstream>
 #include <chrono>
-#include <random>
 #include <algorithm>
 #include <memory>
 #include <iomanip>
@@ -136,30 +135,6 @@ bool TvmInferenceClient::load_artifacts() {
     param_array.size = param_size;
     load_params(param_array);
 
-
-    // 5. Set up input configuration (MobileNet v2 default)
-    input_name_ = "input.1";
-    input_shape_ = {1, 3, 224, 224};
-
-    return true;
-}
-
-bool TvmInferenceClient::prepare_input_data() {
-    int input_size = 1;
-    for (int dim : input_shape_) {
-        input_size *= dim;
-    }
-
-    input_data_.resize(input_size);
-
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> dis(0.0f, 1.0f);
-
-    for (int i = 0; i < input_size; i++) {
-        input_data_[i] = dis(gen);
-    }
-
     return true;
 }
 
@@ -175,146 +150,35 @@ void TvmInferenceClient::process_output_data() {
     output_array.CopyToBytes(output_data_.data(), output_size * sizeof(float));
 }
 
-bool TvmInferenceClient::run_inference_benchmark(int num_iterations) {
+bool TvmInferenceClient::run_inference(std::vector<float>& dint_data, std::vector<float>& inter_data, size_t data_size) {
     if (!initialized_) {
-        return false;
-    }
-
-    if (!prepare_input_data()) {
-        return false;
-    }
-
-    std::vector<double> times;
-
-    for (int i = 0; i < num_iterations; i++) {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        try {
-            // Create input tensor
-            std::vector<int64_t> shape_vec(input_shape_.begin(), input_shape_.end());
-            NDArray input_array = NDArray::Empty(shape_vec, DLDataType{kDLFloat, 32, 1}, {kDLCPU, 0});
-
-            // Copy input data
-            input_array.CopyFromBytes(input_data_.data(), input_data_.size() * sizeof(float));
-
-            // Set input
-            (*set_input_)(input_name_, input_array);
-
-            // Run inference (this automatically uses TIDL acceleration)
-            (*run_)();
-
-            // Process output
-            process_output_data();
-
-        } catch (const std::exception& e) {
-            std::cerr << "Inference " << (i + 1) << " failed: " << e.what() << std::endl;
-            return false;
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        double time_ms = duration.count() / 1000.0;
-
-        times.push_back(time_ms);
-#ifdef DEBUG
-        if (i == 0) {
-            std::cout << "First run (includes init): " << std::fixed << std::setprecision(2) << time_ms << " ms" << std::endl;
-            std::cout << "Output shape: (1, 1000)" << std::endl;
-        }
-#endif
-    }
-
-    if (times.size() > 1) {
-        // Calculate statistics (excluding first run like Python script)
-        std::vector<double> steady_times(times.begin() + 1, times.end());
-
-        double avg_time = 0;
-        double min_time = steady_times[0];
-        double max_time = steady_times[0];
-
-        for (double t : steady_times) {
-            avg_time += t;
-            min_time = std::min(min_time, t);
-            max_time = std::max(max_time, t);
-        }
-        avg_time /= steady_times.size();
-
-        double fps = 1000.0 / avg_time;
-    }
-
-    return true;
-}
-
-bool TvmInferenceClient::run_inference() {
-    if (!initialized_) {
-        std::cerr << "TVM client not initialized" << std::endl;
+        std::cerr << "[TVM] Not initialized" << std::endl;
         return false;
     }
     try {
         auto start = std::chrono::high_resolution_clock::now();
+
+        std::vector<int64_t> shape(input_shape_.begin(), input_shape_.end());
+
+        NDArray input_array = NDArray::Empty(shape, DLDataType{kDLFloat, 32, 1}, {kDLCPU, 0});
+        input_array.CopyFromBytes(dint_data.data(), data_size);
+        (*set_input_)(0, input_array);
         (*run_)();
-        process_output_data();
+
+        NDArray out = (*get_output_)(0);
+        size_t out_bytes = 1;
+        for (int i = 0; i < out->ndim; i++) out_bytes *= out->shape[i];
+        inter_data.resize(out_bytes);
+        out.CopyToBytes(inter_data.data(), data_size);
+
         auto end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
-        std::cout << "[TVM] Inference: " << std::fixed << std::setprecision(2) << ms << " ms" << std::endl;
+
+        std::cout << "[TVM] Inference done in " << ms << " ms, output: " << out_bytes << " floats" << std::endl;
         return true;
+
     } catch (const std::exception& e) {
         std::cerr << "[TVM] Inference failed: " << e.what() << std::endl;
-        return false;
-    }
-}
-
-bool TvmInferenceClient::run_inference_with_data(const void* input_data, size_t input_size) {
-    if (!initialized_) {
-        std::cerr << "TVM client not initialized" << std::endl;
-        return false;
-    }
-
-    // Verify input size matches expected input
-    size_t expected_size = 1; // Calculate expected size
-    for (int dim : input_shape_) {
-        expected_size *= dim;
-    }
-    expected_size *= sizeof(float); // Assuming float32 input
-
-    if (input_size != expected_size) {
-        std::cerr << "Input size mismatch: expected " << expected_size
-                  << " bytes, got " << input_size << " bytes" << std::endl;
-        return false;
-    }
-
-    try {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        // Create input tensor
-        std::vector<int64_t> shape_vec(input_shape_.begin(), input_shape_.end());
-        NDArray input_array = NDArray::Empty(shape_vec, DLDataType{kDLFloat, 32, 1}, {kDLCPU, 0});
-
-        // Copy pipeline input data (instead of test data)
-        input_array.CopyFromBytes(input_data, input_size);
-
-        // Set input
-        (*set_input_)(input_name_, input_array);
-
-        // Run inference
-        (*run_)();
-
-        // Get output
-        NDArray output_array = (*get_output_)(0);
-
-        // Process output data
-        process_output_data();
-
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        double time_ms = duration.count() / 1000.0;
-
-        std::cout << "Pipeline inference: " << std::fixed << std::setprecision(2) << time_ms << " ms" << std::endl;
-
-        return true;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Pipeline inference failed: " << e.what() << std::endl;
         return false;
     }
 }
@@ -368,16 +232,3 @@ bool TvmInferenceClient::run_inference_from_bin(const std::string& bin_path) {
     }
 }
 
-void TvmInferenceClient::print_top5_results() {
-    if (output_data_.size() != 1000) {
-        return;
-    }
-
-    // Find top 5 indices
-    std::vector<std::pair<float, int>> scores;
-    for (int i = 0; i < 1000; i++) {
-        scores.push_back({output_data_[i], i});
-    }
-
-    std::sort(scores.begin(), scores.end(), std::greater<std::pair<float, int>>());
-}
