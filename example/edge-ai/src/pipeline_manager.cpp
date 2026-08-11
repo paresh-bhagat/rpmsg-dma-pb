@@ -26,11 +26,6 @@ extern "C" {
 char rproc_path[] = "/dev/remoteproc0";
 char dma_pool_name[] = "linux,cma";
 
-// TVM Fixed Memory Addresses (hardcoded - no JSON)
-#define TVM_INPUT_ADDR     0xa3000000UL   // STFT output → TVM input
-#define TVM_OUTPUT_ADDR    0xabc00000UL   // TVM output → ISTFT input
-
-
 // Pipeline JSON file paths for --mode command-line invocation
 static const char* PIPELINE_FILE_STFT_ISTFT = "json_files/pipeline_stft_istft.json";
 static const char* PIPELINE_FILE_TVM_ONLY = "json_files/pipeline_tvm_inference.json";
@@ -709,13 +704,11 @@ PipelineManager::CommandResult PipelineManager::executeTensorPipeline() {
     std::cout << "[App] Artifacts: " << state_.tvm_artifacts_paths[0] << std::endl;
     std::cout << "[App] Input:     " << state_.current_input_file << std::endl;
 
-    // Initialize TVM client (sets up buffers at 0xa3000000 and 0xabc00000)
     if (!tvm_client_->initialize(state_.tvm_artifacts_paths[0])) {
         std::cout << "[App] Error: Failed to initialize TVM client" << std::endl;
         return CommandResult::ERROR;
     }
 
-    // Load BIN file and run inference (C7x DSP triggers automatically)
     if (!tvm_client_->run_inference_from_bin(state_.current_input_file)) {
         std::cout << "[App] Error: TVM inference failed" << std::endl;
         return CommandResult::ERROR;
@@ -734,29 +727,6 @@ PipelineManager::CommandResult PipelineManager::executeTensorPipeline() {
     std::cout << "[App] Pipeline completed successfully" << std::endl;
 
     return CommandResult::SUCCESS;
-}
-
-PipelineManager::CommandResult PipelineManager::executeAudioPipeline() {
-    std::cout << "\n[App] === Executing Audio Pipeline ===" << std::endl;
-
-    // Determine pipeline type
-    bool has_stft = false;
-    bool has_tvm = false;
-    bool has_istft = false;
-
-    for (const auto& stage : state_.pipeline_config.stages) {
-        if (stage.message_type == "C7X_MSG_STFT_ANALYZE") has_stft = true;
-        if (stage.service == "tvm") has_tvm = true;
-        if (stage.message_type == "C7X_MSG_ISTFT_SYNTHESIZE") has_istft = true;
-    }
-
-    std::cout << "[App] Pipeline stages: "
-              << (has_stft ? "STFT " : "")
-              << (has_tvm ? "TVM " : "")
-              << (has_istft ? "ISTFT" : "") << std::endl;
-
-    // For audio pipelines, use existing implementation
-    return executeSequentialPipeline();
 }
 
 PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
@@ -780,6 +750,7 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
     // GCRN signal processing parameters (from model_config.h)
     const size_t GCRN_HOP_SIZE    = 160;  // STFT_INPUT_SAMPLES
     const size_t GCRN_MODEL_ELEMS = 322;  // STFT_NUM_BINS*2 = 161*2
+    const size_t GCRN_FFT_SIZE    = 320;  // actual FFT size (fft_size/2+1 = 161 bins)
     const size_t GCRN_BATCH_N     = 64;   // max frames per STFT/ISTFT call
     const size_t GCRN_PAD_FRAMES  = 17;   // padding frames to reach 401 per TVM window
     // TVM window = 6×64 + 17 = 401 frames, fixed input shape [1,2,401,161]
@@ -808,11 +779,12 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
         return CommandResult::ERROR;
     }
 
-    // buf1: STFT audio input (one batch), buf4: ISTFT audio output (one batch)
-    // buf2: spectral buffer (STFT out / ISTFT in) — only when TVM is NOT in pipeline
-    //       when TVM IS in pipeline, fixed DSP addresses are used instead
-    struct dma_buf_params dma_buf1, dma_buf2, dma_buf4;
-    bool dma_buf2_allocated = false;
+    // buf1: STFT audio input (one batch at a time)
+    // buf2: STFT output / deinterleave input (spectral, interleaved per batch)
+    // buf3: interleave output / ISTFT input (spectral, interleaved per batch after TVM)
+    //       no-TVM path: not allocated, ISTFT reads from buf2 directly
+    // buf4: ISTFT audio output (all batches)
+    struct dma_buf_params dma_buf1, dma_buf2, dma_buf3, dma_buf4, dma_buf5, dma_buf6;
 
     int ret1 = dmabuf_heap_init((char*)"linux,cma",
                                 audio_batch_bytes, (char*)"/dev/remoteproc0", &dma_buf1);
@@ -821,41 +793,72 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
         return CommandResult::ERROR;
     }
 
-    if (!has_tvm_stage) {
-        int ret2 = dmabuf_heap_init((char*)"linux,cma",
-                                    spectral_total_bytes, (char*)"/dev/remoteproc0", &dma_buf2);
-        if (ret2 != 0) {
-            std::cout << "[App] Error: Failed to allocate DMA buffer 2 (spectral)" << std::endl;
-            dmabuf_heap_destroy(&dma_buf1);
-            return CommandResult::ERROR;
-        }
-        dma_buf2_allocated = true;
+    int ret2 = dmabuf_heap_init((char*)"linux,cma",
+                                spectral_total_bytes, (char*)"/dev/remoteproc0", &dma_buf2);
+    if (ret2 != 0) {
+        std::cout << "[App] Error: Failed to allocate DMA buffer 2 (STFT output)" << std::endl;
+        dmabuf_heap_destroy(&dma_buf1);
+        return CommandResult::ERROR;
     }
 
-    // Full output buffer for all 7 batches (6×64 + 1×17 frames) so each writes to its own offset
-    size_t audio_total_bytes = GCRN_TOTAL_FRAMES * GCRN_HOP_SIZE * sizeof(int16_t); // 128320 bytes
+    // buf3 always allocated — interleave output for TVM path, or deinterleave→interleave
+    // round-trip for no-TVM path (verifies layout conversion is lossless)
+    int ret3 = dmabuf_heap_init((char*)"linux,cma",
+                                spectral_total_bytes, (char*)"/dev/remoteproc0", &dma_buf3);
+    if (ret3 != 0) {
+        std::cout << "[App] Error: Failed to allocate DMA buffer 3 (interleave output)" << std::endl;
+        dmabuf_heap_destroy(&dma_buf1);
+        dmabuf_heap_destroy(&dma_buf2);
+        return CommandResult::ERROR;
+    }
+
+    // Single batch output buffer — reused for each ISTFT batch (same as buf1)
     int ret4 = dmabuf_heap_init((char*)"linux,cma",
-                                audio_total_bytes, (char*)"/dev/remoteproc0", &dma_buf4);
+                                audio_batch_bytes, (char*)"/dev/remoteproc0", &dma_buf4);
     if (ret4 != 0) {
         std::cout << "[App] Error: Failed to allocate DMA buffer 4 (ISTFT output)" << std::endl;
         dmabuf_heap_destroy(&dma_buf1);
-        if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+        dmabuf_heap_destroy(&dma_buf2);
+        dmabuf_heap_destroy(&dma_buf3);
+        return CommandResult::ERROR;
+    }
+
+
+    int ret5 = dmabuf_heap_init((char*)"linux,cma",
+                                spectral_total_bytes, (char*)"/dev/remoteproc0", &dma_buf5);
+    if (ret5 != 0) {
+        std::cout << "[App] Error: Failed to allocate DMA buffer 5 (deint output)" << std::endl;
+        dmabuf_heap_destroy(&dma_buf1);
+        dmabuf_heap_destroy(&dma_buf2);
+        dmabuf_heap_destroy(&dma_buf3);
+        dmabuf_heap_destroy(&dma_buf4);
+        return CommandResult::ERROR;
+    }
+
+    int ret6 = dmabuf_heap_init((char*)"linux,cma",
+                                spectral_total_bytes, (char*)"/dev/remoteproc0", &dma_buf6);
+    if (ret6 != 0) {
+        std::cout << "[App] Error: Failed to allocate DMA buffer 6 (interleave input)" << std::endl;
+        dmabuf_heap_destroy(&dma_buf1);
+        dmabuf_heap_destroy(&dma_buf2);
+        dmabuf_heap_destroy(&dma_buf3);
+        dmabuf_heap_destroy(&dma_buf4);
+        dmabuf_heap_destroy(&dma_buf5);
         return CommandResult::ERROR;
     }
 
     std::cout << "[App] DMA buffers:" << std::endl;
-    std::cout << "[App]   buf1 (STFT audio in):   phys=0x" << std::hex << dma_buf1.phys_addr
+    std::cout << "[App]   buf1 (STFT audio in):      phys=0x" << std::hex << dma_buf1.phys_addr
               << std::dec << " size=" << dma_buf1.size << std::endl;
-    if (has_tvm_stage) {
-        std::cout << "[App]   STFT out/TVM in:        phys=0x" << std::hex << TVM_INPUT_ADDR
-                  << std::dec << " (fixed)" << std::endl;
-        std::cout << "[App]   TVM out/ISTFT in:       phys=0x" << std::hex << TVM_OUTPUT_ADDR
-                  << std::dec << " (fixed)" << std::endl;
-    } else {
-        std::cout << "[App]   buf2 (STFT out/ISTFT in): phys=0x" << std::hex << dma_buf2.phys_addr
-                  << std::dec << " size=" << dma_buf2.size << std::endl;
-    }
-    std::cout << "[App]   buf4 (ISTFT audio out): phys=0x" << std::hex << dma_buf4.phys_addr
+    std::cout << "[App]   buf2 (STFT out/deint in):  phys=0x" << std::hex << dma_buf2.phys_addr
+              << std::dec << " size=" << dma_buf2.size << std::endl;
+    std::cout << "[App]   buf5 (deint out):          phys=0x" << std::hex << dma_buf5.phys_addr
+              << std::dec << " size=" << dma_buf5.size << std::endl;
+    std::cout << "[App]   buf6 (interleave in):      phys=0x" << std::hex << dma_buf6.phys_addr
+              << std::dec << " size=" << dma_buf6.size << std::endl;
+    std::cout << "[App]   buf3 (int out/ISTFT in):   phys=0x" << std::hex << dma_buf3.phys_addr
+              << std::dec << " size=" << dma_buf3.size << std::endl;
+    std::cout << "[App]   buf4 (ISTFT audio out):    phys=0x" << std::hex << dma_buf4.phys_addr
               << std::dec << " size=" << dma_buf4.size << std::endl;
 
     // Find STFT and ISTFT stages once
@@ -868,8 +871,11 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
     if (!stft_stage_ptr || !istft_stage_ptr) {
         std::cout << "[App] Error: Audio pipeline requires STFT and ISTFT stages" << std::endl;
         dmabuf_heap_destroy(&dma_buf1);
-        if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+        dmabuf_heap_destroy(&dma_buf2);
+        dmabuf_heap_destroy(&dma_buf3);
         dmabuf_heap_destroy(&dma_buf4);
+        dmabuf_heap_destroy(&dma_buf5);
+        dmabuf_heap_destroy(&dma_buf6);
         return CommandResult::ERROR;
     }
 
@@ -892,16 +898,19 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
 
     stream_open();
 
-    uint64_t stft_out_base = has_tvm_stage ? TVM_INPUT_ADDR : dma_buf2.phys_addr;
-    uint64_t istft_src_base = has_tvm_stage ? TVM_OUTPUT_ADDR : dma_buf2.phys_addr;
+    uint64_t stft_out_base  = dma_buf2.phys_addr;
+    uint64_t istft_src_base = dma_buf3.phys_addr;
 
     // Initialize TVM once before the chunk loop
     if (has_tvm_stage && state_.tvm_artifacts_configured && !tvm_client_->is_initialized()) {
         if (!tvm_client_->initialize(state_.tvm_artifacts_paths[0])) {
             std::cout << "[App] Error: Failed to initialize TVM client" << std::endl;
             dmabuf_heap_destroy(&dma_buf1);
-            if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+            dmabuf_heap_destroy(&dma_buf2);
+            dmabuf_heap_destroy(&dma_buf3);
             dmabuf_heap_destroy(&dma_buf4);
+            dmabuf_heap_destroy(&dma_buf5);
+            dmabuf_heap_destroy(&dma_buf6);
             stream_close();
             return CommandResult::ERROR;
         }
@@ -962,8 +971,11 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
                 std::cout << "[App] Error: STFT batch " << (batch_idx+1)
                           << " failed: " << r.error_message << std::endl;
                 dmabuf_heap_destroy(&dma_buf1);
-                if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf3);
                 dmabuf_heap_destroy(&dma_buf4);
+                dmabuf_heap_destroy(&dma_buf5);
+                dmabuf_heap_destroy(&dma_buf6);
                 stream_close();
                 return CommandResult::ERROR;
             }
@@ -976,17 +988,86 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
         // =====================================================
         double t_tvm_ms = 0.0;
         auto t_tvm_start = std::chrono::high_resolution_clock::now();
+
+        if (debug_)
+            std::cout << "[App]   Deinterleave: 0x" << std::hex << dma_buf2.phys_addr
+                      << " -> 0x" << dma_buf5.phys_addr << std::dec << std::endl;
+        {
+            std::map<std::string, std::string> params;
+            char in_str[32], out_str[32];
+            snprintf(in_str,  sizeof(in_str),  "0x%lx", dma_buf2.phys_addr);
+            snprintf(out_str, sizeof(out_str), "0x%lx", dma_buf5.phys_addr);
+            params["input_buffer"]  = in_str;
+            params["output_buffer"] = out_str;
+            params["input_frame"]   = std::to_string(GCRN_TOTAL_FRAMES);
+            params["fft_size"]      = std::to_string(GCRN_FFT_SIZE);
+            params["flag"]          = "0";  // deinterleave
+            auto r = generic_client_->process("C7X_DEINTERLEAVE_MSG_ANALYZE",
+                                              nullptr, 0, nullptr, 0, params);
+            if (!r.success) {
+                std::cout << "[App] Error: deinterleave failed: " << r.error_message << std::endl;
+                dmabuf_heap_destroy(&dma_buf1);
+                dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf3);
+                dmabuf_heap_destroy(&dma_buf4);
+                dmabuf_heap_destroy(&dma_buf5);
+                dmabuf_heap_destroy(&dma_buf6);
+                stream_close();
+                return CommandResult::ERROR;
+            }
+        }
+        deint_output_data_.resize(spectral_total_bytes / sizeof(float));
+        inter_input_data_.resize(spectral_total_bytes / sizeof(float));
+
+        dmabuf_sync(dma_buf5.dma_buf_fd, DMA_BUF_SYNC_START);
+        memcpy(deint_output_data_.data(), dma_buf5.kern_addr, spectral_total_bytes);
+        dmabuf_sync(dma_buf5.dma_buf_fd, DMA_BUF_SYNC_END);
+        // TVM only runs when pipeline has TVM stage
         if (has_tvm_stage && tvm_client_->is_initialized()) {
-            if (!tvm_client_->run_inference()) {
+            if (!tvm_client_->run_inference(deint_output_data_, inter_input_data_, spectral_total_bytes)) {
                 std::cout << "[App] Error: TVM inference failed" << std::endl;
                 dmabuf_heap_destroy(&dma_buf1);
-                if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf3);
                 dmabuf_heap_destroy(&dma_buf4);
+                dmabuf_heap_destroy(&dma_buf5);
+                dmabuf_heap_destroy(&dma_buf6);
                 stream_close();
                 return CommandResult::ERROR;
             }
             t_tvm_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::high_resolution_clock::now() - t_tvm_start).count() / 1000.0;
+        }
+	
+        dmabuf_sync(dma_buf6.dma_buf_fd, DMA_BUF_SYNC_START);
+        memcpy(dma_buf6.kern_addr, inter_input_data_.data(), spectral_total_bytes);
+        dmabuf_sync(dma_buf6.dma_buf_fd, DMA_BUF_SYNC_END);
+        if (debug_)
+            std::cout << "[App]   Interleave: 0x" << std::hex << dma_buf6.phys_addr
+                      << " -> 0x" << dma_buf3.phys_addr << std::dec << std::endl;
+        {
+            std::map<std::string, std::string> params;
+            char in_str[32], out_str[32];
+            snprintf(in_str,  sizeof(in_str),  "0x%lx", dma_buf6.phys_addr);
+            snprintf(out_str, sizeof(out_str), "0x%lx", dma_buf3.phys_addr);
+            params["input_buffer"]  = in_str;
+            params["output_buffer"] = out_str;
+            params["input_frame"]   = std::to_string(GCRN_TOTAL_FRAMES);
+            params["fft_size"]      = std::to_string(GCRN_FFT_SIZE);
+            params["flag"]          = "1";  // interleave
+            auto r = generic_client_->process("C7X_DEINTERLEAVE_MSG_ANALYZE",
+                                              nullptr, 0, nullptr, 0, params);
+            if (!r.success) {
+                std::cout << "[App] Error: interleave failed: " << r.error_message << std::endl;
+                dmabuf_heap_destroy(&dma_buf1);
+                dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf3);
+                dmabuf_heap_destroy(&dma_buf4);
+                dmabuf_heap_destroy(&dma_buf5);
+                dmabuf_heap_destroy(&dma_buf6);
+                stream_close();
+                return CommandResult::ERROR;
+            }
         }
 
         // =====================================================
@@ -1000,12 +1081,10 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
             size_t audio_offset       = (chunk_frame_offset + batch_idx * GCRN_BATCH_N) * GCRN_HOP_SIZE;
             size_t audio_bytes        = samples_this_batch * sizeof(int16_t);
             uint64_t spectral_offset  = batch_idx * GCRN_BATCH_N * GCRN_MODEL_ELEMS * sizeof(float);
-            uint64_t audio_out_offset = batch_idx * GCRN_BATCH_N * GCRN_HOP_SIZE * sizeof(int16_t);
-
             auto params = istft_stage_ptr->parameters;
             char in_str[32], out_str[32];
             snprintf(in_str,  sizeof(in_str),  "0x%lx", istft_src_base + spectral_offset);
-            snprintf(out_str, sizeof(out_str), "0x%lx", dma_buf4.phys_addr + audio_out_offset);
+            snprintf(out_str, sizeof(out_str), "0x%lx", dma_buf4.phys_addr);
             params["input_buffer"]  = in_str;
             params["output_buffer"] = out_str;
             params["input_frame"]   = std::to_string(frames_this_batch);
@@ -1015,7 +1094,7 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
                 std::cout << "[App]   ISTFT batch " << (batch_idx+1) << "/" << num_batches_this_chunk
                           << ": " << frames_this_batch << " frames"
                           << " in=0x" << std::hex << (istft_src_base + spectral_offset)
-                          << " out=0x" << (dma_buf4.phys_addr + audio_out_offset) << std::dec << std::endl;
+                          << " out=0x" << dma_buf4.phys_addr << std::dec << std::endl;
 
             auto r = generic_client_->process("C7X_MSG_ISTFT_SYNTHESIZE",
                                               nullptr, 0, nullptr, 0, params);
@@ -1023,14 +1102,17 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
                 std::cout << "[App] Error: ISTFT batch " << (batch_idx+1)
                           << " failed: " << r.error_message << std::endl;
                 dmabuf_heap_destroy(&dma_buf1);
-                if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf2);
+                dmabuf_heap_destroy(&dma_buf3);
                 dmabuf_heap_destroy(&dma_buf4);
+                dmabuf_heap_destroy(&dma_buf5);
+                dmabuf_heap_destroy(&dma_buf6);
                 stream_close();
                 return CommandResult::ERROR;
             }
 
             dmabuf_sync(dma_buf4.dma_buf_fd, DMA_BUF_SYNC_START);
-            int16_t* out_ptr = (int16_t*)dma_buf4.kern_addr + batch_idx * GCRN_BATCH_N * GCRN_HOP_SIZE;
+            int16_t* out_ptr = (int16_t*)dma_buf4.kern_addr;
 
             if (debug_) {
                 std::cout << "[App]   Frame | InRMS  OutRMS | In[0..4]              | Out[0..4]" << std::endl;
@@ -1092,8 +1174,11 @@ PipelineManager::CommandResult PipelineManager::executeSequentialPipeline()
         std::cout << "[App] ERROR: Failed to save output file" << std::endl;
 
     dmabuf_heap_destroy(&dma_buf1);
-    if (dma_buf2_allocated) dmabuf_heap_destroy(&dma_buf2);
+    dmabuf_heap_destroy(&dma_buf2);
+    dmabuf_heap_destroy(&dma_buf3);
     dmabuf_heap_destroy(&dma_buf4);
+    dmabuf_heap_destroy(&dma_buf5);
+    dmabuf_heap_destroy(&dma_buf6);
     stream_close();
 
     return CommandResult::SUCCESS;

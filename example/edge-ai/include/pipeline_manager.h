@@ -74,7 +74,6 @@ public:
 
     PipelineManager();
     ~PipelineManager();
-
     bool initialize();
     int run();
     int run_direct(PipelineMode mode, const std::string& input_file, const std::string& artifacts_path = "");
@@ -85,6 +84,8 @@ private:
     std::shared_ptr<TvmInferenceClient> tvm_client_;
     std::unique_ptr<GenericTaskClient> generic_client_;
     State state_;
+    std::vector<float> deint_output_data_;
+    std::vector<float> inter_input_data_;
     bool initialized_;
     bool debug_ = false;
     std::string app_name_;
@@ -115,7 +116,6 @@ private:
     bool validateConfiguration();
     bool loadPipelineFromJson(const std::string& json_content);
 
-    CommandResult executeAudioPipeline();
     CommandResult executeTensorPipeline();
     CommandResult executeSequentialPipeline();
 
