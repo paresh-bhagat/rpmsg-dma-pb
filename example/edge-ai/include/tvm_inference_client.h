@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <cstdint>
 
 // Forward declarations to avoid including TVM headers here
 namespace tvm {
@@ -30,6 +31,7 @@ private:
     // Model info
     std::string input_name_;
     std::vector<int> input_shape_;
+    int dma_buffer_fd_{-1};
 
 public:
     TvmInferenceClient();
@@ -40,8 +42,13 @@ public:
     void cleanup();
 
     // Inference
+    bool run_inference(const std::vector<float>& input_data,
+                       std::vector<float>& output_data);
+    bool run_inference(const std::vector<float>& input_data,
+                       std::vector<float>& output_data,
+                       const std::vector<int64_t>& input_shape);
     bool run_inference(std::vector<float>& dint_data, std::vector<float>& inter_data, size_t data_size);
-    bool run_inference_from_bin(const std::string& bin_path);
+    bool run_inference(const std::string& bin_path);
 
     // Status
     bool is_initialized() const { return initialized_; }
@@ -49,11 +56,13 @@ public:
     const std::vector<int>& get_input_shape() const { return input_shape_; }
     void set_input_shape(const std::vector<int>& shape) { input_shape_ = shape; }
     void set_input_name(const std::string& name) { input_name_ = name; }
+    void set_dma_buffer_fd(int descriptor) noexcept { dma_buffer_fd_ = descriptor; }
 
 private:
     // Helper methods
     bool load_artifacts();
     void process_output_data();
+    bool synchronize_dma_buffer(int operation) const noexcept;
     std::string load_json_file(const std::string& path);
 };
 

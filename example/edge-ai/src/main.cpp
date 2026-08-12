@@ -1,116 +1,81 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <signal.h>
-#include <cstring>
-
 #include "pipeline_manager.h"
 
-// Firmware switching support
-extern "C" {
-#include "fw_loader.h"
-}
+#include <csignal>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <string_view>
 
-/** @brief Path to the base firmware for the C7x processor. */
-#define C7_BASE_FW      "/lib/firmware/ti-ipc/am62dxx/ipc_echo_test_c7x_1_release_strip.xe71"
+namespace {
 
-/** @brief Path to the TVM firmware for the C7x processor. */
-#define C7_TVM_FW       "/lib/firmware/c7x_compute.release.out"
-
-/** @brief Symbolic link to the firmware for the C7x processor. */
-#define C7_FW_LINK      "/lib/firmware/am62d-c71_0-fw"
-
-/** @brief Path to the state file for the remote processor. */
-#define C7_FW_STATE     "/sys/class/remoteproc/remoteproc0/state"
-
-// Global application instance for signal handling
-static PipelineManager* g_app = nullptr;
-
-/**
- * @brief Signal handler for graceful shutdown
- */
-void signal_handler(int signum)
+void signal_handler(int signal_number)
 {
-    printf("\n[App] Received signal %d, shutting down...\n", signum);
-
-    exit(signum);
+    std::_Exit(128 + signal_number);
 }
 
-/**
- * @brief Setup signal handlers for graceful shutdown
- */
 void setup_signal_handlers()
 {
-    signal(SIGINT, signal_handler);   // Ctrl+C
-    signal(SIGTERM, signal_handler);  // Termination request
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
 }
 
-/**
- * @brief Print command-line usage
- */
-void print_usage(const char* prog_name)
+void print_usage(std::string_view program)
 {
-    printf("Usage:\n");
-    printf("  %s                          Interactive mode (readline shell)\n", prog_name);
-    printf("  %s <pipeline.json>          Run pipeline from JSON configuration file\n", prog_name);
-    printf("  %s <pipeline.json> --debug  Run with verbose per-batch debug logs\n", prog_name);
-    printf("  %s --help                   Show this help\n", prog_name);
-    printf("\nJSON configuration file fields:\n");
-    printf("  pipeline_id     Pipeline identifier string\n");
-    printf("  description     Human-readable description\n");
-    printf("  input_file      Path to input BIN file\n");
-    printf("  output_file     Output data size\n");
-    printf("  artifacts_path  Path to TVM artifacts directory (optional, for TVM stages)\n");
-    printf("  stages          Array of pipeline stage objects\n");
-    printf("\nExample:\n");
-    printf("  %s pipeline_stft_istft.json\n", prog_name);
-    printf("  %s pipeline_tvm_inference.json\n", prog_name);
-    printf("  %s pipeline_audio_enhancement.json\n", prog_name);
+    std::cout
+        << "Usage:\n"
+        << "  " << program << "                          Interactive mode\n"
+        << "  " << program << " <pipeline.json>          Run a JSON pipeline\n"
+        << "  " << program << " <pipeline.json> --debug  Enable per-batch logs\n"
+        << "  " << program << " --help                   Show this help\n\n"
+        << "Examples:\n"
+        << "  " << program << " pipeline_tvm_inference.json\n"
+        << "  " << program << " pipeline_audio_enhancement.json --debug\n";
 }
 
-/**
- * @brief Main application entry point
- */
-int main(int argc, char *argv[])
+} // namespace
+
+int main(int argc, char* argv[])
 {
-    printf("===========================================\n");
-    printf("       RPMsg Inference Example\n");
-    printf("===========================================\n\n");
+    try {
+        std::string json_file;
+        bool debug = false;
 
-    std::string json_file;
-    bool debug = false;
-
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--help" || arg == "-h") {
-            print_usage(argv[0]);
-            return 0;
-        } else if (arg == "--debug" || arg == "-d") {
-            debug = true;
-        } else if (arg.rfind("--", 0) == 0) {
-            printf("[App] Unknown argument: %s\n", argv[i]);
-            print_usage(argv[0]);
-            return -1;
-        } else {
-            json_file = arg;
+        for (int index = 1; index < argc; ++index) {
+            const std::string_view argument{argv[index]};
+            if (argument == "--help" || argument == "-h") {
+                print_usage(argv[0]);
+                return EXIT_SUCCESS;
+            }
+            if (argument == "--debug" || argument == "-d") {
+                debug = true;
+                continue;
+            }
+            if (argument.rfind("--", 0) == 0) {
+                std::cerr << "[App] Unknown argument: " << argument << '\n';
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            if (!json_file.empty()) {
+                std::cerr << "[App] Only one pipeline file may be specified\n";
+                return EXIT_FAILURE;
+            }
+            json_file = argument;
         }
+
+        setup_signal_handlers();
+        std::cout << "===========================================\n"
+                     "       RPMsg Inference Example\n"
+                     "===========================================\n\n";
+
+        PipelineManager application;
+        application.set_debug(debug);
+        const int exit_code = json_file.empty()
+                                  ? application.run()
+                                  : application.run_from_json_file(json_file);
+        std::cout << "[App] Application exited with code " << exit_code << '\n';
+        return exit_code;
+    } catch (const std::exception& error) {
+        std::cerr << "[App] Fatal error: " << error.what() << '\n';
+        return EXIT_FAILURE;
     }
-
-    // Setup signal handlers for graceful shutdown
-    setup_signal_handlers();
-
-    // Create and run pipeline manager
-    PipelineManager app;
-    g_app = &app;
-    app.set_debug(debug);
-
-    int exit_code;
-    if (!json_file.empty()) {
-        exit_code = app.run_from_json_file(json_file);
-    } else {
-        exit_code = app.run();
-    }
-
-    printf("[App] Application exited with code %d\n", exit_code);
-    return exit_code;
 }

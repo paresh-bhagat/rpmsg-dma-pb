@@ -53,6 +53,10 @@ public:
                            uint32_t output_size,
                            const std::map<std::string, std::string>& parameters = {});
 
+    ProcessingResult process(
+        const std::string& message_type,
+        const std::map<std::string, std::string>& parameters = {});
+
     /**
      * @brief Get status from the Generic Service
      * @return ProcessingResult with service statistics
