@@ -1,7 +1,7 @@
 {
   "pipeline_id": "audio_stft_istft",
   "description": "STFT round-trip pipeline: STFT analyze -> ISTFT synthesize (no TVM)",
-  "input_file": "/usr/share/tvm_inference/input/input_noisy_audio.wav",
+  "input_file": "/usr/share/tvm_inference/input/input_audio.wav",
   "stages": [
     {
       "stage_id": "stft_analysis",
