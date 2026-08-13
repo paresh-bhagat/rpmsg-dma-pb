@@ -1,0 +1,26 @@
+{
+  "pipeline_id": "audio_gcrn_pipeline",
+  "description": "GCRN 3-stage audio pipeline: STFT analyze -> TVM inference -> ISTFT synthesize",
+  "input_file": "/usr/share/tvm_inference/input/input_noisy_audio.wav",
+  "artifacts_path": "/usr/share/tvm_inference/artifacts/",
+  "stages": [
+    {
+      "stage_id": "stft_analysis",
+      "service": "generic",
+      "message_type": "C7X_MSG_STFT_ANALYZE",
+      "parameters": {}
+    },
+    {
+      "stage_id": "tvm_inference",
+      "service": "tvm",
+      "message_type": "TVM_INFERENCE",
+      "parameters": {}
+    },
+    {
+      "stage_id": "stft_synthesis",
+      "service": "generic",
+      "message_type": "C7X_MSG_ISTFT_SYNTHESIZE",
+      "parameters": {}
+    }
+  ]
+}
