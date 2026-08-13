@@ -101,6 +101,5 @@ DESTINATION /usr/share/tvm_inference/json)
 # Install input files to /usr/share/tvm_inference/input/
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/input_audio/input_audio.wav
-    ${CMAKE_CURRENT_SOURCE_DIR}/input_audio/input_noisy_audio.wav
     ${CMAKE_CURRENT_SOURCE_DIR}/artifacts_bin/gcrn_fixed_input.bin
     DESTINATION /usr/share/tvm_inference/input)

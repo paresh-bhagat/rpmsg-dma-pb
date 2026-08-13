@@ -8,9 +8,19 @@
 
 namespace {
 
+constexpr std::string_view APP_VERSION   = "0.0.3";
+constexpr std::string_view BUILD_DATE    = __DATE__;
+constexpr std::string_view BUILD_TIME    = __TIME__;
+
 void signal_handler(int signal_number)
 {
     std::_Exit(128 + signal_number);
+}
+
+void print_version()
+{
+    std::cout << "edge-ai v" << APP_VERSION
+              << " (built " << BUILD_DATE << " " << BUILD_TIME << ")\n";
 }
 
 void setup_signal_handlers()
@@ -26,6 +36,7 @@ void print_usage(std::string_view program)
         << "  " << program << "                          Interactive mode\n"
         << "  " << program << " <pipeline.json>          Run a JSON pipeline\n"
         << "  " << program << " <pipeline.json> --debug  Enable per-batch logs\n"
+	<< "  " << program << " --version                Show version and build info\n"
         << "  " << program << " --help                   Show this help\n\n"
         << "Examples:\n"
         << "  " << program << " pipeline_tvm_inference.json\n"
@@ -46,6 +57,10 @@ int main(int argc, char* argv[])
                 print_usage(argv[0]);
                 return EXIT_SUCCESS;
             }
+	    if (argument == "--version" || argument == "-v") {
+                print_version();
+                return EXIT_SUCCESS;
+            }
             if (argument == "--debug" || argument == "-d") {
                 debug = true;
                 continue;
@@ -63,6 +78,7 @@ int main(int argc, char* argv[])
         }
 
         setup_signal_handlers();
+        print_version();
         std::cout << "===========================================\n"
                      "       RPMsg Inference Example\n"
                      "===========================================\n\n";
