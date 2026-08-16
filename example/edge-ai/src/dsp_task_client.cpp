@@ -1,4 +1,4 @@
-#include "generic_task_client.h"
+#include "dsp_task_client.h"
 #include <unistd.h>
 #include <iostream>
 #include <limits>
@@ -11,10 +11,6 @@ extern "C" {
 
 namespace {
 
-constexpr int C7_PROC_ID = 8;
-constexpr int RMT_EP = 13;
-constexpr uint32_t TVM_STAGING_PHYS = 0xa3000000U;
-constexpr uint32_t TVM_RESULT_PHYS = 0xabc00000U;
 
 uint32_t parameter_value(const std::map<std::string, std::string>& parameters,
                          const std::string& name, uint32_t default_value,
@@ -90,25 +86,27 @@ bool exchange_message(int descriptor, Message& request, Message& response)
 
 } // namespace
 
-GenericTaskClient::GenericTaskClient()
-    : rpmsg_fd_(-1), initialized_(false), sequence_number_(1)
+DspTaskClient::DspTaskClient()
+    : rpmsg_fd_(-1), proc_id_(0), endpoint_(0), initialized_(false), sequence_number_(1)
 {
-    shared_input_addr_ = TVM_STAGING_PHYS;
-    shared_output_addr_ = TVM_RESULT_PHYS;
 }
 
-GenericTaskClient::~GenericTaskClient()
+DspTaskClient::~DspTaskClient()
 {
     shutdown();
 }
 
-bool GenericTaskClient::initialize(uint32_t max_input_size, uint32_t max_output_size)
+bool DspTaskClient::initialize(int proc_id, int endpoint,
+                               uint32_t max_input_size, uint32_t max_output_size)
 {
     (void)max_input_size;
     (void)max_output_size;
     if (initialized_) {
         return true;
     }
+
+    proc_id_  = proc_id;
+    endpoint_ = endpoint;
 
     if (!open_rpmsg_device()) {
         return false;
@@ -118,16 +116,16 @@ bool GenericTaskClient::initialize(uint32_t max_input_size, uint32_t max_output_
     return true;
 }
 
-bool GenericTaskClient::open_rpmsg_device()
+bool DspTaskClient::open_rpmsg_device()
 {
-    rpmsg_fd_ = init_rpmsg(C7_PROC_ID, RMT_EP);
+    rpmsg_fd_ = init_rpmsg(proc_id_, endpoint_);
     if (rpmsg_fd_ < 0) {
         return false;
     }
     return true;
 }
 
-void GenericTaskClient::close_rpmsg_device()
+void DspTaskClient::close_rpmsg_device()
 {
     if (rpmsg_fd_ >= 0) {
         ::close(rpmsg_fd_);
@@ -135,7 +133,7 @@ void GenericTaskClient::close_rpmsg_device()
     }
 }
 
-GenericTaskClient::ProcessingResult GenericTaskClient::process(const std::string& message_type,
+DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& message_type,
                                                              void* input_data,
                                                              uint32_t input_size,
                                                              void* output_data,
@@ -164,8 +162,8 @@ GenericTaskClient::ProcessingResult GenericTaskClient::process(const std::string
         req.hdr.len = sizeof(struct stft_process_msg);
         req.hdr.status = 0;
 
-        req.input_buffer = parameter_value(parameters, "input_buffer", shared_input_addr_, 16);
-        req.output_buffer = parameter_value(parameters, "output_buffer", shared_output_addr_, 16);
+        req.input_buffer = parameter_value(parameters, "input_buffer", 0, 16);
+        req.output_buffer = parameter_value(parameters, "output_buffer", 0, 16);
         req.input_frame = parameter_value(parameters, "input_frame", 0);
         req.output_frame = parameter_value(parameters, "output_frame", 0);
         req.graph_id = parameter_value(parameters, "graph_id", 0);
@@ -209,8 +207,8 @@ GenericTaskClient::ProcessingResult GenericTaskClient::process(const std::string
         req.hdr.len = sizeof(struct stft_process_msg);
         req.hdr.status = 0;
 
-        req.input_buffer = parameter_value(parameters, "input_buffer", shared_input_addr_, 16);
-        req.output_buffer = parameter_value(parameters, "output_buffer", shared_output_addr_, 16);
+        req.input_buffer = parameter_value(parameters, "input_buffer", 0, 16);
+        req.output_buffer = parameter_value(parameters, "output_buffer", 0, 16);
         req.input_frame = parameter_value(parameters, "input_frame", 0);
         req.output_frame = parameter_value(parameters, "output_frame", 0);
         req.graph_id = parameter_value(parameters, "graph_id", 0);
@@ -254,8 +252,8 @@ GenericTaskClient::ProcessingResult GenericTaskClient::process(const std::string
         req.hdr.len    = sizeof(struct deinterleave_interleave_msg);
         req.hdr.status = 0;
 
-        req.input_buffer = parameter_value(parameters, "input_buffer", shared_input_addr_, 16);
-        req.output_buffer = parameter_value(parameters, "output_buffer", shared_output_addr_, 16);
+        req.input_buffer = parameter_value(parameters, "input_buffer", 0, 16);
+        req.output_buffer = parameter_value(parameters, "output_buffer", 0, 16);
         req.input_frame = parameter_value(parameters, "input_frame", 0);
         req.fft_size = parameter_value(parameters, "fft_size", 0);
         req.flag = parameter_value(parameters, "flag", 0);
@@ -292,14 +290,14 @@ GenericTaskClient::ProcessingResult GenericTaskClient::process(const std::string
     return result;
 }
 
-GenericTaskClient::ProcessingResult GenericTaskClient::process(
+DspTaskClient::ProcessingResult DspTaskClient::process(
     const std::string& message_type,
     const std::map<std::string, std::string>& parameters)
 {
     return process(message_type, nullptr, 0, nullptr, 0, parameters);
 }
 
-GenericTaskClient::ProcessingResult GenericTaskClient::get_service_status()
+DspTaskClient::ProcessingResult DspTaskClient::get_service_status()
 {
     ProcessingResult result = {};
     result.success = initialized_;
@@ -309,13 +307,13 @@ GenericTaskClient::ProcessingResult GenericTaskClient::get_service_status()
     return result;
 }
 
-bool GenericTaskClient::ping_service()
+bool DspTaskClient::ping_service()
 {
     // STFT service doesn't have separate ping - just return initialized status
     return initialized_;
 }
 
-void GenericTaskClient::shutdown()
+void DspTaskClient::shutdown()
 {
     if (initialized_) {
         close_rpmsg_device();
@@ -323,7 +321,7 @@ void GenericTaskClient::shutdown()
     }
 }
 
-std::string GenericTaskClient::get_error_string(int32_t error_code)
+std::string DspTaskClient::get_error_string(int32_t error_code)
 {
     switch (error_code) {
         case C7X_STATUS_SUCCESS: return "Success";

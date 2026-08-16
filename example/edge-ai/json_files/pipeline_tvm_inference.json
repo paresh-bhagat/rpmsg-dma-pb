@@ -1,5 +1,5 @@
 {
-  "pipeline_id": "tensor_tvm_only",
+  "pipeline_type": "tvm_only",
   "description": "Direct TVM inference pipeline: BIN tensor input -> TVM inference -> Binary output",
   "input_file": "/usr/share/tvm_inference/input/gcrn_fixed_input.bin",
   "artifacts_path": "/usr/share/tvm_inference/artifacts/",

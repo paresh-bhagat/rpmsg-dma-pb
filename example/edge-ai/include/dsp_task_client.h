@@ -1,5 +1,5 @@
-#ifndef GENERIC_TASK_CLIENT_H
-#define GENERIC_TASK_CLIENT_H
+#ifndef DSP_TASK_CLIENT_H
+#define DSP_TASK_CLIENT_H
 
 #include <stdint.h>
 #include <string>
@@ -17,7 +17,7 @@ extern "C" {
  * Message type determines which struct and processing logic to use.
  * Uses zero-copy approach with TVM shared memory regions.
  */
-class GenericTaskClient {
+class DspTaskClient {
 public:
     struct ProcessingResult {
         bool success;
@@ -26,8 +26,8 @@ public:
         std::string error_message;
     };
 
-    GenericTaskClient();
-    ~GenericTaskClient();
+    DspTaskClient();
+    ~DspTaskClient();
 
     /**
      * @brief Initialize the Generic Task client
@@ -35,7 +35,9 @@ public:
      * @param max_output_size Maximum output buffer size in bytes
      * @return true on success, false on failure
      */
-    bool initialize(uint32_t max_input_size = 1024*1024, uint32_t max_output_size = 1024*1024);
+    bool initialize(int proc_id, int endpoint,
+                    uint32_t max_input_size = 1024*1024,
+                    uint32_t max_output_size = 1024*1024);
 
     /**
      * @brief Generic processing function
@@ -83,12 +85,10 @@ public:
 private:
     // RPMsg communication
     int rpmsg_fd_;
+    int proc_id_;
+    int endpoint_;
     bool initialized_;
     uint32_t sequence_number_;
-
-    // Shared memory addresses (zero-copy approach)
-    uint32_t shared_input_addr_;       // TVM staging physical address (0xa3000000)
-    uint32_t shared_output_addr_;      // TVM result physical address (0xabc00000)
 
     // Internal methods
     bool open_rpmsg_device();
@@ -98,4 +98,4 @@ private:
     std::string get_error_string(int32_t error_code);
 };
 
-#endif // GENERIC_TASK_CLIENT_H
+#endif // DSP_TASK_CLIENT_H

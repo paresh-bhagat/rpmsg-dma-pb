@@ -27,8 +27,13 @@ message(STATUS "Using TVM_ROOT: ${TVM_ROOT}")
 set(EDGE_AI_SOURCES
     src/main.cpp
     src/tvm_inference_client.cpp
-    src/generic_task_client.cpp
+    src/dsp_task_client.cpp
     src/pipeline_manager.cpp
+    src/pipeline_common.cpp
+    src/audio_utils.cpp
+    src/tvm_pipeline.cpp
+    src/stft_istft_pipeline.cpp
+    src/audio_enhancement_pipeline.cpp
 )
 
 # Create the executable
@@ -69,9 +74,6 @@ pkg_check_modules(JSON_C REQUIRED json-c)
 # Add json-c include directory
 target_include_directories(rpmsg_inference_example PRIVATE ${JSON_C_INCLUDE_DIRS})
 
-# Find readline library for interactive mode with command line editing
-find_library(READLINE_LIB readline REQUIRED)
-
 # Find audio libraries for WAV file processing and playback
 find_library(SNDFILE_LIB sndfile REQUIRED)
 find_library(ALSA_LIB asound REQUIRED)
@@ -81,7 +83,6 @@ target_link_libraries(rpmsg_inference_example
     ${TVM_RUNTIME_LIB}
     ti_rpmsg_dma
     ${JSON_C_LIBRARIES}
-    ${READLINE_LIB}
     ${SNDFILE_LIB}
     ${ALSA_LIB}
     pthread
