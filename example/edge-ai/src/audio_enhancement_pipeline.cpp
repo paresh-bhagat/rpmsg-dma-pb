@@ -128,19 +128,31 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
         std::cout << "[App]   buf6 (interleave in):      phys=0x" << std::hex << dma_buf6->phys_addr
                   << std::dec << " size=" << dma_buf6->size << std::endl;
 
-        // Chunk calculation
-        const size_t total_frames =
-            (audio_data.size() + HOP_SIZE - 1) / HOP_SIZE;
-        audio_data.resize(total_frames * HOP_SIZE, int16_t{0});
-        const size_t num_full_chunks = total_frames / TOTAL_FRAMES;
-        const size_t partial_frames  = total_frames % TOTAL_FRAMES;
-        const size_t num_chunks      = num_full_chunks + (partial_frames > 0 ? 1 : 0);
+        // Overlap-save chunking parameters (sample level)
+        const size_t OVERLAP_FRAMES  = 100;  // frames of overlap between chunks
+        const size_t T_FRAMES        = OVERLAP_FRAMES / 2;  // trim from each edge
+        const size_t HOP_FRAMES      = TOTAL_FRAMES - OVERLAP_FRAMES;
+        const size_t T_SAMPLES       = T_FRAMES * HOP_SIZE;
+        const size_t HOP_SAMPLES     = HOP_FRAMES * HOP_SIZE;
+        const size_t CHUNK_SAMPLES   = TOTAL_FRAMES * HOP_SIZE;
 
-        std::cout << "[App] Full file processing:" << std::endl;
-        std::cout << "[App]   Total frames: " << total_frames
-                  << " | Full chunks: " << num_full_chunks
-                  << " | Partial chunk: " << partial_frames << " real frames"
-                  << " (zero-padded to " << TOTAL_FRAMES << ")" << std::endl;
+        // Pad audio so last chunk is full TOTAL_FRAMES
+        const size_t n_samples   = audio_data.size();
+        size_t n_chunks;
+        if (n_samples <= CHUNK_SAMPLES) {
+            n_chunks = 1;
+        } else {
+            n_chunks = 1 + static_cast<size_t>(
+                std::ceil(static_cast<double>(n_samples - CHUNK_SAMPLES) / HOP_SAMPLES));
+        }
+        const size_t padded_len = (n_chunks - 1) * HOP_SAMPLES + CHUNK_SAMPLES;
+        audio_data.resize(padded_len, int16_t{0});
+
+        std::cout << "[App] Overlap-save chunking:" << std::endl;
+        std::cout << "[App]   TOTAL_FRAMES=" << TOTAL_FRAMES
+                  << " OVERLAP_FRAMES=" << OVERLAP_FRAMES
+                  << " HOP_FRAMES=" << HOP_FRAMES
+                  << " n_chunks=" << n_chunks << std::endl;
 
         // Initialize TVM — read input shape from TVM stage parameters
         if (tvm_stage_ptr && state.tvm_artifacts_configured && !tvm_client.is_initialized()) {
@@ -169,7 +181,7 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
         }
 
         std::vector<int16_t> processed_audio_data;
-        processed_audio_data.reserve(total_frames * HOP_SIZE);
+        processed_audio_data.reserve(n_samples);
 
         AudioStream audio_stream;
 
@@ -181,11 +193,15 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
 
         auto t_total_start = std::chrono::steady_clock::now();
 
-        for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
-            const size_t chunk_frame_offset   = chunk_idx * TOTAL_FRAMES;
+        for (size_t chunk_idx = 0; chunk_idx < n_chunks; chunk_idx++) {
+            // Sample offset for this chunk (overlap-save: chunks are HOP_SAMPLES apart)
+            const size_t chunk_sample_offset  = chunk_idx * HOP_SAMPLES;
+            const size_t chunk_frame_offset   = chunk_sample_offset / HOP_SIZE;
             const size_t num_batches_chunk    = NUM_BATCHES;
-            const size_t real_frames_chunk    = (chunk_idx == num_full_chunks && partial_frames > 0)
-                                                ? partial_frames : TOTAL_FRAMES;
+
+            // Trim-reconstruct: which output samples to keep from this chunk
+            const size_t lo_sample = (chunk_idx == 0)           ? 0              : T_SAMPLES;
+            const size_t hi_sample = (chunk_idx == n_chunks - 1) ? CHUNK_SAMPLES  : CHUNK_SAMPLES - T_SAMPLES;
 
             auto t_chunk_start = std::chrono::steady_clock::now();
 
@@ -194,7 +210,7 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
             for (size_t batch_idx = 0; batch_idx < num_batches_chunk; batch_idx++) {
                 const size_t frames_this_batch  = (batch_idx < NUM_BATCHES - 1) ? BATCH_N : PAD_FRAMES;
                 const size_t samples_this_batch = frames_this_batch * HOP_SIZE;
-                const size_t audio_offset       = (chunk_frame_offset + batch_idx * BATCH_N) * HOP_SIZE;
+                const size_t audio_offset       = chunk_sample_offset + batch_idx * BATCH_N * HOP_SIZE;
                 const size_t audio_bytes        = samples_this_batch * sizeof(int16_t);
                 const uint64_t spectral_offset  = batch_idx * BATCH_N * MODEL_ELEMS * sizeof(float);
 
@@ -286,15 +302,17 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
                     throw PipelineError{"Interleave failed: " + r.error_message};
             }
 
-            // Phase 5: ISTFT
+            // Phase 5: ISTFT — collect full chunk output into temporary buffer
             const size_t ISTFT_PAD_FRAMES  = ISTFT_TOTAL_FRAMES % ISTFT_BATCH_N;
             const size_t ISTFT_NUM_BATCHES = (ISTFT_TOTAL_FRAMES + ISTFT_BATCH_N - 1) / ISTFT_BATCH_N;
+            std::vector<int16_t> chunk_output;
+            chunk_output.reserve(CHUNK_SAMPLES);
+
             auto t_istft_start = std::chrono::steady_clock::now();
-            size_t real_samples_remaining = real_frames_chunk * ISTFT_HOP_SIZE;
             for (size_t batch_idx = 0; batch_idx < ISTFT_NUM_BATCHES; batch_idx++) {
                 const size_t frames_this_batch  = (batch_idx < ISTFT_NUM_BATCHES - 1) ? ISTFT_BATCH_N : ISTFT_PAD_FRAMES;
                 const size_t samples_this_batch = frames_this_batch * ISTFT_HOP_SIZE;
-                const size_t audio_offset       = (chunk_frame_offset + batch_idx * ISTFT_BATCH_N) * ISTFT_HOP_SIZE;
+                const size_t audio_offset       = chunk_sample_offset + batch_idx * ISTFT_BATCH_N * ISTFT_HOP_SIZE;
                 const uint64_t spectral_offset  = batch_idx * ISTFT_BATCH_N * ISTFT_MODEL_ELEMS * sizeof(float);
 
                 auto params = istft_stage_ptr->parameters;
@@ -304,7 +322,7 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
                 params["output_frame"]  = std::to_string(frames_this_batch);
 
                 if (debug)
-                    std::cout << "[App]   ISTFT batch " << (batch_idx+1) << "/" << num_batches_chunk
+                    std::cout << "[App]   ISTFT batch " << (batch_idx+1) << "/" << ISTFT_NUM_BATCHES
                               << ": " << frames_this_batch << " frames"
                               << " in=0x" << std::hex << (istft_src_base + spectral_offset)
                               << " out=0x" << dma_buf4->phys_addr << std::dec << std::endl;
@@ -319,9 +337,7 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
 
                 if (debug) {
                     std::cout << "[App]   Frame | InRMS  OutRMS | In[0..4]              | Out[0..4]" << std::endl;
-                    const size_t available_frames = std::min(
-                        frames_this_batch, real_samples_remaining / ISTFT_HOP_SIZE);
-                    for (size_t f = 0; f < std::min(size_t{4}, available_frames); ++f) {
+                    for (size_t f = 0; f < std::min(size_t{4}, frames_this_batch); ++f) {
                         const size_t in_off  = audio_offset + f * ISTFT_HOP_SIZE;
                         const size_t out_off = f * ISTFT_HOP_SIZE;
                         float in_sum = 0.0f, out_sum = 0.0f;
@@ -334,8 +350,8 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
                         std::cout << "[App]   " << std::setw(5)
                                   << (chunk_frame_offset + batch_idx * ISTFT_BATCH_N + f + 1)
                                   << " | " << std::fixed << std::setprecision(4)
-                                  << std::sqrt(in_sum / HOP_SIZE) << "  "
-                                  << std::sqrt(out_sum / HOP_SIZE)
+                                  << std::sqrt(in_sum / ISTFT_HOP_SIZE) << "  "
+                                  << std::sqrt(out_sum / ISTFT_HOP_SIZE)
                                   << " | In:";
                         for (size_t i = 0; i < 5; i++)
                             std::cout << std::setw(6) << audio_data[in_off + i] << (i<4?",":"");
@@ -346,23 +362,28 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
                     }
                 }
 
-                size_t samples_to_collect = std::min(samples_this_batch, real_samples_remaining);
-                std::copy_n(out_ptr, samples_to_collect,
-                            std::back_inserter(processed_audio_data));
-                real_samples_remaining -= samples_to_collect;
-
+                std::copy_n(out_ptr, samples_this_batch, std::back_inserter(chunk_output));
                 dma_buf4.end_cpu_access();
-                audio_stream.send_frame(1, out_ptr, samples_to_collect * sizeof(int16_t));
             }
             double t_istft_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t_istft_start).count() / 1000.0;
 
+            // Trim-reconstruct: keep [lo_sample..hi_sample) from this chunk
+            const size_t keep_end = std::min(hi_sample, chunk_output.size());
+            if (lo_sample < keep_end) {
+                std::copy(chunk_output.begin() + static_cast<std::ptrdiff_t>(lo_sample),
+                          chunk_output.begin() + static_cast<std::ptrdiff_t>(keep_end),
+                          std::back_inserter(processed_audio_data));
+                audio_stream.send_frame(1,
+                    chunk_output.data() + lo_sample,
+                    (keep_end - lo_sample) * sizeof(int16_t));
+            }
+
             double t_chunk_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t_chunk_start).count() / 1000.0;
 
-            std::cout << "[App] Chunk " << (chunk_idx+1) << "/" << num_chunks
-                      << " [" << real_frames_chunk << " real frames"
-                      << (real_frames_chunk < ISTFT_TOTAL_FRAMES ? " + zero-pad" : "") << "]"
+            std::cout << "[App] Chunk " << (chunk_idx+1) << "/" << n_chunks
+                      << " [keep samples " << lo_sample << ".." << keep_end << "]"
                       << " | STFT=" << std::fixed << std::setprecision(1) << t_stft_ms << "ms"
                       << " TVM=" << t_tvm_ms << "ms"
                       << " ISTFT=" << t_istft_ms << "ms"
@@ -376,9 +397,9 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
                   << t_total_ms << "ms | " << (processed_audio_data.size() / ISTFT_HOP_SIZE)
                   << " output frames (" << processed_audio_data.size() << " samples)" << std::endl;
 
-        if (processed_audio_data.size() < original_sample_count)
-            throw PipelineError{"Pipeline produced fewer samples than expected"};
-        processed_audio_data.resize(original_sample_count);
+        // Trim to original length (remove any zero-padding)
+        if (processed_audio_data.size() > original_sample_count)
+            processed_audio_data.resize(original_sample_count);
 
         std::string output_filename = "processed_output.wav";
         if (!saveAudioFile(output_filename, processed_audio_data))
