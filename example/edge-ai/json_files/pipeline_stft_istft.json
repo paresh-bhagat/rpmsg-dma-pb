@@ -12,6 +12,7 @@
       "service": "generic",
       "message_type": "C7X_MSG_STFT_ANALYZE",
       "parameters": {
+        "selected_model": 2,
         "hop_size": 160,
         "model_elems": 322,
         "total_frames": 401,
@@ -41,6 +42,7 @@
       "service": "generic",
       "message_type": "C7X_MSG_ISTFT_SYNTHESIZE",
       "parameters": {
+        "selected_model": 2,
         "hop_size": 160,
         "model_elems": 322,
         "total_frames": 401,

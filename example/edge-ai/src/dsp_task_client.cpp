@@ -35,13 +35,14 @@ struct c7x_msg_hdr {
     int32_t  status;
 };
 
-struct stft_process_msg {
+struct stft_istft_msg {
     struct c7x_msg_hdr hdr;
+    uint32_t selected_model; /* ModelId: MODEL_DCCRN=0, MODEL_GTCRN=1, MODEL_GCRN=2,
+                              *          MODEL_VGGISH=3, MODEL_YAMNET=4 (see model_config.h) */
     uint32_t input_buffer;
     uint32_t output_buffer;
     uint32_t input_frame;
     uint32_t output_frame;
-    uint32_t graph_id;
 };
 
 enum c7x_msg_type {
@@ -63,7 +64,7 @@ struct deinterleave_interleave_msg {
 };
 
 static_assert(sizeof(c7x_msg_hdr) == 16);
-static_assert(sizeof(stft_process_msg) == 36);
+static_assert(sizeof(stft_istft_msg) == 36);
 static_assert(sizeof(deinterleave_interleave_msg) == 36);
 
 enum c7x_status {
@@ -156,26 +157,26 @@ DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& messag
     try {
     // Determine message type and send appropriate struct
     if (message_type == "C7X_MSG_STFT_ANALYZE") {
-        struct stft_process_msg req = {};
+        struct stft_istft_msg req = {};
         req.hdr.type = C7X_MSG_STFT_ANALYZE;
         req.hdr.seq = sequence_number_++;
-        req.hdr.len = sizeof(struct stft_process_msg);
+        req.hdr.len = sizeof(struct stft_istft_msg);
         req.hdr.status = 0;
 
+        req.selected_model = parameter_value(parameters, "selected_model", 0);
         req.input_buffer = parameter_value(parameters, "input_buffer", 0, 16);
         req.output_buffer = parameter_value(parameters, "output_buffer", 0, 16);
         req.input_frame = parameter_value(parameters, "input_frame", 0);
         req.output_frame = parameter_value(parameters, "output_frame", 0);
-        req.graph_id = parameter_value(parameters, "graph_id", 0);
 #ifdef DEBUG
         std::cout << "[GenericClient] STFT_ANALYZE - Sending to firmware:" << std::endl;
+        std::cout << "[GenericClient]   selected_model=" << req.selected_model << std::endl;
         std::cout << "[GenericClient]   input_buffer=0x" << std::hex << req.input_buffer << std::endl;
         std::cout << "[GenericClient]   output_buffer=0x" << std::hex << req.output_buffer << std::endl;
         std::cout << "[GenericClient]   input_frame=" << std::dec << req.input_frame << " frames" << std::endl;
         std::cout << "[GenericClient]   output_frame=" << std::dec << req.output_frame << " frames" << std::endl;
-        std::cout << "[GenericClient]   graph_id=" << req.graph_id << std::endl;
 #endif
-        struct stft_process_msg resp = {};
+        struct stft_istft_msg resp = {};
         if (!exchange_message(rpmsg_fd_, req, resp)) {
             result.error_message = "STFT analyze message exchange failed";
             return result;
@@ -201,26 +202,26 @@ DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& messag
         result.output_size = resp.output_frame;
 
     } else if (message_type == "C7X_MSG_ISTFT_SYNTHESIZE") {
-        struct stft_process_msg req = {};
+        struct stft_istft_msg req = {};
         req.hdr.type = C7X_MSG_ISTFT_SYNTHESIZE;
         req.hdr.seq = sequence_number_++;
-        req.hdr.len = sizeof(struct stft_process_msg);
+        req.hdr.len = sizeof(struct stft_istft_msg);
         req.hdr.status = 0;
 
+        req.selected_model = parameter_value(parameters, "selected_model", 0);
         req.input_buffer = parameter_value(parameters, "input_buffer", 0, 16);
         req.output_buffer = parameter_value(parameters, "output_buffer", 0, 16);
         req.input_frame = parameter_value(parameters, "input_frame", 0);
         req.output_frame = parameter_value(parameters, "output_frame", 0);
-        req.graph_id = parameter_value(parameters, "graph_id", 0);
 #ifdef DEBUG
         std::cout << "[GenericClient] ISTFT_SYNTHESIZE - Sending to firmware:" << std::endl;
+        std::cout << "[GenericClient]   selected_model=" << req.selected_model << std::endl;
         std::cout << "[GenericClient]   input_buffer=0x" << std::hex << req.input_buffer << std::endl;
         std::cout << "[GenericClient]   output_buffer=0x" << std::hex << req.output_buffer << std::endl;
         std::cout << "[GenericClient]   input_frame=" << std::dec << req.input_frame << " frames" << std::endl;
         std::cout << "[GenericClient]   output_frame=" << std::dec << req.output_frame << " frames" << std::endl;
-        std::cout << "[GenericClient]   graph_id=" << req.graph_id << std::endl;
 #endif
-        struct stft_process_msg resp = {};
+        struct stft_istft_msg resp = {};
         if (!exchange_message(rpmsg_fd_, req, resp)) {
             result.error_message = "ISTFT synthesize message exchange failed";
             return result;
