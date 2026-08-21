@@ -13,6 +13,63 @@ extern "C" {
 #include <json-c/json.h>
 }
 
+// ─── Model cache ──────────────────────────────────────────────────────────────
+
+std::string PipelineManager::read_model_cache()
+{
+    std::ifstream f(MODEL_CACHE_FILE);
+    if (!f.is_open())
+        return {};
+    std::string path;
+    std::getline(f, path);
+    return path;
+}
+
+bool PipelineManager::write_model_cache(const std::string& artifacts_path)
+{
+    std::filesystem::create_directories(
+        std::filesystem::path(MODEL_CACHE_FILE).parent_path());
+    std::ofstream f(MODEL_CACHE_FILE, std::ios::trunc);
+    if (!f.is_open()) {
+        std::cerr << "[App] Warning: cannot write model cache: " << MODEL_CACHE_FILE << std::endl;
+        return false;
+    }
+    f << artifacts_path << '\n';
+    return true;
+}
+
+// ─── Preload default model at boot ────────────────────────────────────────────
+
+int PipelineManager::preload_default_model()
+{
+    if (!initialize())
+        return -1;
+
+    const std::string artifacts = DEFAULT_ARTIFACTS_PATH;
+    std::cout << "[App] Preloading default model: " << artifacts << std::endl;
+
+    const std::string cached = read_model_cache();
+    if (cached == artifacts) {
+        std::cout << "[App] Model already loaded (cache matches), nothing to do." << std::endl;
+        return 0;
+    }
+
+    tvm_client_ = std::make_shared<TvmInferenceClient>();
+    if (!tvm_client_->initialize(artifacts)) {
+        std::cerr << "[App] Failed to load default model from: " << artifacts << std::endl;
+        return -1;
+    }
+    tvm_client_->set_input_shape({1, 2, 401, 161});
+
+    if (!write_model_cache(artifacts))
+        std::cerr << "[App] Warning: model loaded but cache write failed" << std::endl;
+
+    std::cout << "[App] Default model loaded and cached." << std::endl;
+    return 0;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 PipelineManager::PipelineManager()
     : initialized_(false)
 {

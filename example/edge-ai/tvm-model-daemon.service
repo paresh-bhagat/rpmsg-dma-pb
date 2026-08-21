@@ -1,0 +1,17 @@
+[Unit]
+Description=TVM Model Loader Daemon (GCRN Speech Enhancement)
+# Must be ready before the webserver so the first demo run hits the daemon
+After=sysinit.target local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tvm_model_daemon
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# Socket lives in /var/run — always present, no pre-create needed
+
+[Install]
+WantedBy=multi-user.target
