@@ -1,4 +1,5 @@
 #include "tvm_inference_client.h"
+#include "tvm_daemon_proto.h"
 
 #include <iostream>
 #include <fstream>
@@ -10,6 +11,9 @@
 #include <numeric>
 #include <stdexcept>
 
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 // TVM runtime includes
 #include <tvm/runtime/module.h>
@@ -25,6 +29,26 @@ extern "C" {
 using namespace tvm::runtime;
 
 namespace {
+
+static bool sock_write_all(int fd, const void* buf, size_t len) {
+    const auto* p = static_cast<const uint8_t*>(buf);
+    while (len > 0) {
+        ssize_t n = ::write(fd, p, len);
+        if (n <= 0) return false;
+        p += static_cast<size_t>(n); len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool sock_read_all(int fd, void* buf, size_t len) {
+    auto* p = static_cast<uint8_t*>(buf);
+    while (len > 0) {
+        ssize_t n = ::read(fd, p, len);
+        if (n <= 0) return false;
+        p += static_cast<size_t>(n); len -= static_cast<size_t>(n);
+    }
+    return true;
+}
 
 template <typename Tensor>
 size_t tensor_element_count(const Tensor* tensor)
@@ -45,9 +69,8 @@ size_t tensor_element_count(const Tensor* tensor)
 
 } // namespace
 
-bool TvmInferenceClient::synchronize_dma_buffer(int operation) const noexcept {
-    // DMA synchronization is optional until a caller supplies a valid fd.
-    return dma_buffer_fd_ < 0 || dmabuf_sync(dma_buffer_fd_, operation) == 0;
+bool TvmInferenceClient::synchronize_dma_buffer(int fd, int operation) const noexcept {
+    return fd < 0 || dmabuf_sync(fd, operation) == 0;
 }
 
 TvmInferenceClient::TvmInferenceClient() : initialized_(false) {
@@ -66,6 +89,15 @@ bool TvmInferenceClient::initialize(const std::string& artifacts_path) {
 
     artifacts_path_ = artifacts_path;
 
+    /* Fast path: delegate to persistent daemon — skips Module::LoadFromFile */
+    if (!daemon_skip_ && try_daemon_connect()) {
+        initialized_ = true;
+        std::cout << "[TVM] Connected to model daemon at "
+                  << TvmDaemon::SOCKET_PATH << std::endl;
+        return true;
+    }
+
+    /* Fall back to loading artifacts locally */
     try {
         if (!load_artifacts())
             return false;
@@ -79,7 +111,83 @@ bool TvmInferenceClient::initialize(const std::string& artifacts_path) {
     }
 }
 
+bool TvmInferenceClient::try_daemon_connect() {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, TvmDaemon::SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return false;
+    }
+
+    /* Ping/pong: confirm daemon is alive and ready */
+    TvmDaemon::Header ping{TvmDaemon::MAGIC,
+                           static_cast<uint32_t>(TvmDaemon::MsgType::PING), 0};
+    TvmDaemon::Header pong{};
+    if (!sock_write_all(fd, &ping, sizeof(ping)) ||
+        !sock_read_all(fd, &pong, sizeof(pong)) ||
+        pong.magic != TvmDaemon::MAGIC ||
+        pong.type  != static_cast<uint32_t>(TvmDaemon::MsgType::PONG)) {
+        ::close(fd);
+        return false;
+    }
+
+    daemon_fd_ = fd;
+    return true;
+}
+
+bool TvmInferenceClient::run_via_daemon(const float* input, float* output, size_t count) {
+    const uint32_t in_bytes = static_cast<uint32_t>(count * sizeof(float));
+    TvmDaemon::Header req{TvmDaemon::MAGIC,
+                          static_cast<uint32_t>(TvmDaemon::MsgType::INFER_REQ),
+                          in_bytes};
+
+    if (!sock_write_all(daemon_fd_, &req, sizeof(req)) ||
+        !sock_write_all(daemon_fd_, input, in_bytes)) {
+        std::cerr << "[TVM] Daemon: failed to send request\n";
+        return false;
+    }
+
+    TvmDaemon::Header resp{};
+    if (!sock_read_all(daemon_fd_, &resp, sizeof(resp)) ||
+        resp.magic != TvmDaemon::MAGIC) {
+        std::cerr << "[TVM] Daemon: invalid response header\n";
+        return false;
+    }
+
+    if (resp.type == static_cast<uint32_t>(TvmDaemon::MsgType::ERROR_RESP)) {
+        std::vector<char> msg(resp.len + 1, '\0');
+        sock_read_all(daemon_fd_, msg.data(), resp.len);
+        std::cerr << "[TVM] Daemon error: " << msg.data() << '\n';
+        return false;
+    }
+
+    if (resp.type != static_cast<uint32_t>(TvmDaemon::MsgType::INFER_RESP)) {
+        std::cerr << "[TVM] Daemon: unexpected response type " << resp.type << '\n';
+        return false;
+    }
+
+    const size_t out_floats = resp.len / sizeof(float);
+    if (out_floats > count) {
+        std::cerr << "[TVM] Daemon: output too large (" << out_floats
+                  << " > " << count << ")\n";
+        return false;
+    }
+
+    if (!sock_read_all(daemon_fd_, output, resp.len)) {
+        std::cerr << "[TVM] Daemon: failed to read output\n";
+        return false;
+    }
+
+    return true;
+}
+
 void TvmInferenceClient::cleanup() {
+    if (daemon_fd_ >= 0) { ::close(daemon_fd_); daemon_fd_ = -1; }
     get_output_.reset();
     run_.reset();
     set_input_.reset();
@@ -167,7 +275,7 @@ bool TvmInferenceClient::load_artifacts() {
 
     // Load parameters into executor
     auto load_params = graph_executor_->GetFunction("load_params");
-    if (load_params == nullptr) 
+    if (load_params == nullptr)
         return false;
     TVMByteArray param_array;
     param_array.data = reinterpret_cast<const char*>(param_data.data());
@@ -206,6 +314,11 @@ bool TvmInferenceClient::run_inference(const std::vector<float>& input_data,
         return false;
     }
 
+    if (daemon_fd_ >= 0) {
+        output_data.resize(input_data.size());
+        return run_via_daemon(input_data.data(), output_data.data(), input_data.size());
+    }
+
     try {
         const size_t shape_elements = std::accumulate(
             input_shape.begin(), input_shape.end(), size_t{1},
@@ -220,6 +333,9 @@ bool TvmInferenceClient::run_inference(const std::vector<float>& input_data,
 
         const auto start = std::chrono::steady_clock::now();
 
+        if (!synchronize_dma_buffer(dma_input_fd_, DMA_BUF_SYNC_START))
+            throw std::runtime_error{"Failed to sync input DMA buffer for CPU access"};
+
         NDArray input_array = NDArray::Empty(input_shape, DLDataType{kDLFloat, 32, 1}, {kDLCPU, 0});
         input_array.CopyFromBytes(input_data.data(), input_data.size() * sizeof(float));
         if (input_name_.empty())
@@ -232,6 +348,92 @@ bool TvmInferenceClient::run_inference(const std::vector<float>& input_data,
         const size_t output_elements = tensor_element_count(out.operator->());
         output_data.resize(output_elements);
         out.CopyToBytes(output_data.data(), output_elements * sizeof(float));
+
+        if (!synchronize_dma_buffer(dma_output_fd_, DMA_BUF_SYNC_END))
+            throw std::runtime_error{"Failed to complete DMA buffer cache synchronization"};
+
+        const auto end = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+
+        std::cout << "[TVM] Inference done in " << ms << " ms, output: "
+                  << output_elements << " floats" << std::endl;
+        return true;
+
+    } catch (const std::exception& e) {
+        std::cerr << "[TVM] Inference failed: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+bool TvmInferenceClient::run_inference(const float* input, float* output, size_t count) {
+    if (!initialized_) {
+        std::cerr << "[TVM] Not initialized" << std::endl;
+        return false;
+    }
+    if (!input || count == 0 || !output) {
+        std::cerr << "[TVM] Invalid input/output pointer or count" << std::endl;
+        return false;
+    }
+
+    /* Daemon mode — send over socket instead of running TVM locally */
+    if (daemon_fd_ >= 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = run_via_daemon(input, output, count);
+        const double ms = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count() / 1000.0;
+        if (ok) std::cout << "[TVM] Daemon inference done in " << ms
+                          << " ms, " << count << " floats\n";
+        return ok;
+    }
+
+    std::vector<int64_t> shape;
+    if (input_shape_.empty())
+        shape = {static_cast<int64_t>(count)};
+    else
+        shape.assign(input_shape_.begin(), input_shape_.end());
+
+    try {
+        const size_t shape_elements = std::accumulate(
+            shape.begin(), shape.end(), size_t{1},
+            [](size_t total, int64_t extent) {
+                if (extent <= 0 || total > std::numeric_limits<size_t>::max() /
+                                             static_cast<size_t>(extent))
+                    throw std::overflow_error{"Invalid TVM input shape"};
+                return total * static_cast<size_t>(extent);
+            });
+        if (shape_elements != count)
+            throw std::runtime_error{"TVM input shape does not match the input count"};
+
+        const auto start = std::chrono::steady_clock::now();
+
+        if (!synchronize_dma_buffer(dma_input_fd_, DMA_BUF_SYNC_START))
+            throw std::runtime_error{"Failed to sync input DMA buffer for CPU access"};
+
+        NDArray input_array = NDArray::Empty(shape, DLDataType{kDLFloat, 32, 1}, {kDLCPU, 0});
+        input_array.CopyFromBytes(input, count * sizeof(float));
+        if (input_name_.empty())
+            (*set_input_)(0, input_array);
+        else
+            (*set_input_)(String{input_name_}, input_array);
+
+        if (!synchronize_dma_buffer(dma_input_fd_, DMA_BUF_SYNC_END))
+            throw std::runtime_error{"Failed to end input DMA buffer sync"};
+
+        (*run_)();
+
+        if (!synchronize_dma_buffer(dma_output_fd_, DMA_BUF_SYNC_START))
+            throw std::runtime_error{"Failed to sync output DMA buffer for CPU access"};
+
+        NDArray out = (*get_output_)(0);
+        const size_t output_elements = tensor_element_count(out.operator->());
+        if (output_elements > count)
+            throw std::runtime_error{"Output buffer too small: need " +
+                                     std::to_string(output_elements) + " floats, got " +
+                                     std::to_string(count)};
+        out.CopyToBytes(output, output_elements * sizeof(float));
+
+        if (!synchronize_dma_buffer(dma_output_fd_, DMA_BUF_SYNC_END))
+            throw std::runtime_error{"Failed to complete output DMA buffer sync"};
 
         const auto end = std::chrono::steady_clock::now();
         double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
@@ -287,5 +489,5 @@ bool TvmInferenceClient::run_inference(const std::string& bin_path) {
     std::cout << "[TVM] Loaded " << num_floats << " floats from " << bin_path << std::endl;
 
     return run_inference(input_data_, output_data_,
- 		         std::vector<int64_t>{static_cast<int64_t>(num_floats)});
+                         std::vector<int64_t>{static_cast<int64_t>(num_floats)});
 }

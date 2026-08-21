@@ -35,6 +35,7 @@ void print_usage(std::string_view program)
         << "Usage:\n"
         << "  " << program << " <pipeline.json>          Run a JSON pipeline\n"
         << "  " << program << " <pipeline.json> --debug  Enable per-batch logs\n"
+        << "  " << program << " --preload                Load default model into C7x (run at boot)\n"
         << "  " << program << " --version                Show version and build info\n"
         << "  " << program << " --help                   Show this help\n\n"
         << "Examples:\n"
@@ -49,6 +50,7 @@ int main(int argc, char* argv[])
     try {
         std::string json_file;
         bool debug = false;
+        bool preload = false;
 
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument{argv[index]};
@@ -64,6 +66,10 @@ int main(int argc, char* argv[])
                 debug = true;
                 continue;
             }
+            if (argument == "--preload") {
+                preload = true;
+                continue;
+            }
             if (argument.rfind("--", 0) == 0) {
                 std::cerr << "[App] Unknown argument: " << argument << '\n';
                 print_usage(argv[0]);
@@ -76,7 +82,7 @@ int main(int argc, char* argv[])
             json_file = argument;
         }
 
-        if (json_file.empty()) {
+        if (!preload && json_file.empty()) {
             std::cerr << "[App] Error: A pipeline JSON file is required\n";
             print_usage(argv[0]);
             return EXIT_FAILURE;
@@ -90,6 +96,10 @@ int main(int argc, char* argv[])
 
         PipelineManager application;
         application.set_debug(debug);
+
+        if (preload)
+            return application.preload_default_model();
+
         const int exit_code = application.run_from_json_file(json_file);
         std::cout << "[App] Application exited with code " << exit_code << '\n';
         return exit_code;

@@ -71,8 +71,16 @@ message(STATUS "Using TVM runtime: ${TVM_RUNTIME_LIB}")
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSON_C REQUIRED json-c)
 
+pkg_get_variable(SYSTEMD_SYSTEM_UNITDIR systemd systemdsystemunitdir)
+if(NOT SYSTEMD_SYSTEM_UNITDIR)
+    set(SYSTEMD_SYSTEM_UNITDIR "${CMAKE_INSTALL_PREFIX}/lib/systemd/system")
+endif()
+
 # Add json-c include directory
 target_include_directories(rpmsg_inference_example PRIVATE ${JSON_C_INCLUDE_DIRS})
+
+# Find readline library for interactive mode with command line editing
+find_library(READLINE_LIB readline REQUIRED)
 
 # Find audio libraries for WAV file processing and playback
 find_library(SNDFILE_LIB sndfile REQUIRED)
@@ -83,6 +91,7 @@ target_link_libraries(rpmsg_inference_example
     ${TVM_RUNTIME_LIB}
     ti_rpmsg_dma
     ${JSON_C_LIBRARIES}
+    ${READLINE_LIB}
     ${SNDFILE_LIB}
     ${ALSA_LIB}
     pthread
@@ -92,15 +101,54 @@ target_link_libraries(rpmsg_inference_example
 # Install target
 install(TARGETS rpmsg_inference_example DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# ── Model loader daemon ──────────────────────────────────────────────────────
+# Loads Module::LoadFromFile once at boot and serves inference requests over a
+# Unix domain socket so that rpmsg_inference_example skips artifact loading.
+
+add_executable(tvm_model_daemon
+    src/tvm_model_daemon.cpp
+    src/tvm_inference_client.cpp
+)
+
+target_include_directories(tvm_model_daemon PRIVATE
+    include
+    ${TVM_ROOT}/include
+    ${TVM_ROOT}/3rdparty/dlpack/include
+    ${TVM_ROOT}/3rdparty/dmlc-core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../library/include
+)
+
+target_compile_definitions(tvm_model_daemon PRIVATE
+    DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>
+)
+
+target_link_libraries(tvm_model_daemon
+    ${TVM_RUNTIME_LIB}
+    ti_rpmsg_dma
+    dl
+    pthread
+)
+
+install(TARGETS tvm_model_daemon DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 # Install JSON pipeline configuration files to /usr/share/tvm_inference/json/
 install(FILES
 ${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_stft_istft.json
 ${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_tvm_inference.json
 ${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_audio_enhancement.json
-DESTINATION /usr/share/tvm_inference/json)
+DESTINATION ${CMAKE_INSTALL_DATADIR}/tvm_inference/json)
 
 # Install input files to /usr/share/tvm_inference/input/
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/input_audio/input_audio.wav
     ${CMAKE_CURRENT_SOURCE_DIR}/artifacts_bin/gcrn_fixed_input.bin
-    DESTINATION /usr/share/tvm_inference/input)
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/tvm_inference/input)
+
+# Install systemd services
+install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/tvm-model-preload.service
+    ${CMAKE_CURRENT_SOURCE_DIR}/tvm-model-daemon.service
+    DESTINATION ${SYSTEMD_SYSTEM_UNITDIR})
+
+# Create the model cache directory at install time
+install(DIRECTORY DESTINATION /var/lib/tvm_inference)

@@ -1,0 +1,17 @@
+[Unit]
+Description=Preload default TVM model into C7x DSP
+# Run after remoteproc firmware is up and filesystem is mounted
+After=sysinit.target local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/rpmsg_inference_example --preload
+StandardOutput=journal
+StandardError=journal
+# Create the cache directory with correct permissions before first run
+ExecStartPre=/bin/mkdir -p /var/lib/tvm_inference
+
+[Install]
+WantedBy=multi-user.target

@@ -64,10 +64,16 @@ public:
         State() : input_type(InputType::UNKNOWN) {}
     };
 
+    // Path where the currently-loaded model artifacts path is persisted across runs
+    static constexpr const char* MODEL_CACHE_FILE = "/var/lib/tvm_inference/loaded_model";
+    // Default artifacts loaded at boot via --preload
+    static constexpr const char* DEFAULT_ARTIFACTS_PATH = "/usr/share/tvm_inference/artifacts/";
+
     PipelineManager();
     ~PipelineManager();
     bool initialize();
     int run_from_json_file(const std::string& json_file_path);
+    int preload_default_model();
     void set_debug(bool enable) { debug_ = enable; }
 
 private:
@@ -79,6 +85,10 @@ private:
 
     bool validateConfiguration();
     bool loadPipelineFromJson(const std::string& json_content);
+
+    // Model cache: read/write the artifacts path persisted on disk
+    static std::string read_model_cache();
+    static bool write_model_cache(const std::string& artifacts_path);
 };
 
 #endif // PIPELINE_MANAGER_H
