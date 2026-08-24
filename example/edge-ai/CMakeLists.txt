@@ -34,6 +34,7 @@ set(EDGE_AI_SOURCES
     src/tvm_pipeline.cpp
     src/stft_istft_pipeline.cpp
     src/audio_enhancement_pipeline.cpp
+    src/audio_classification_pipeline.cpp
 )
 
 # Create the executable
@@ -136,6 +137,7 @@ install(FILES
 ${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_stft_istft.json
 ${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_tvm_inference.json
 ${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_audio_enhancement.json
+${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_audio_classification.json
 DESTINATION ${CMAKE_INSTALL_DATADIR}/tvm_inference/json)
 
 # Install input files to /usr/share/tvm_inference/input/

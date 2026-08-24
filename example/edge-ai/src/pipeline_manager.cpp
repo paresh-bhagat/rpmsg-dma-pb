@@ -4,6 +4,7 @@
 #include "tvm_pipeline.h"
 #include "stft_istft_pipeline.h"
 #include "audio_enhancement_pipeline.h"
+#include "audio_classification_pipeline.h"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -164,6 +165,8 @@ int PipelineManager::run_from_json_file(const std::string& json_file_path)
         result = run_audio_enhancement_pipeline(state_, *generic_client_, *tvm_client_, debug_);
     } else if (pipeline_type == "stft_istft") {
         result = run_stft_istft_pipeline(state_, *generic_client_, debug_);
+    } else if (pipeline_type == "audio_classification") {
+        result = run_audio_classification_pipeline(state_, *generic_client_, debug_);
     } else {
         std::cout << "[App] Error: Unknown pipeline_type: " << pipeline_type << std::endl;
         return -1;
