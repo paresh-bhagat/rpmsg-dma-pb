@@ -1,4 +1,4 @@
-#include "audio_classification_pipeline.h"
+#include "speech_classification_pipeline.h"
 #include "pipeline_common.h"
 #include "audio_utils.h"
 #include <algorithm>
@@ -29,14 +29,14 @@ size_t require_param(const std::map<std::string, std::string>& params,
 
 } // namespace
 
-PipelineManager::CommandResult run_audio_classification_pipeline(
+PipelineManager::CommandResult run_speech_classification_pipeline(
     PipelineManager::State& state,
     DspTaskClient& dsp_client,
     bool debug)
 {
     try {
         if (state.input_type != PipelineManager::InputType::AUDIO_WAV)
-            throw PipelineError{"audio_classification pipeline requires a .wav input file"};
+            throw PipelineError{"speech_classification pipeline requires a .wav input file"};
 
         const PipelineManager::PipelineStage* stft_stage_ptr = nullptr;
         for (const auto& stage : state.pipeline_config.stages) {
@@ -46,7 +46,7 @@ PipelineManager::CommandResult run_audio_classification_pipeline(
             }
         }
         if (!stft_stage_ptr)
-            throw PipelineError{"audio_classification pipeline requires a C7X_MSG_STFT_ANALYZE stage"};
+            throw PipelineError{"speech_classification pipeline requires a C7X_MSG_STFT_ANALYZE stage"};
 
         const auto& sp        = stft_stage_ptr->parameters;
         const size_t HOP_SIZE     = require_param(sp, "hop_size",     stft_stage_ptr->stage_id.c_str());

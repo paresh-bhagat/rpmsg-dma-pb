@@ -1,5 +1,4 @@
-# TVM Inference Client - uses TVM runtime with existing Python artifacts
-# Replicates functionality of inference.py using C++ and TVM runtime
+# Edge-AI RPMsg inference example
 
 cmake_minimum_required(VERSION 3.10)
 project(rpmsg_inference_example)
@@ -23,7 +22,7 @@ endif()
 
 message(STATUS "Using TVM_ROOT: ${TVM_ROOT}")
 
-# Source files (Interactive Pipeline Application)
+# Source files
 set(EDGE_AI_SOURCES
     src/main.cpp
     src/tvm_inference_client.cpp
@@ -33,8 +32,8 @@ set(EDGE_AI_SOURCES
     src/audio_utils.cpp
     src/tvm_pipeline.cpp
     src/stft_istft_pipeline.cpp
-    src/audio_enhancement_pipeline.cpp
-    src/audio_classification_pipeline.cpp
+    src/speech_enhancement_pipeline.cpp
+    src/speech_classification_pipeline.cpp
 )
 
 # Create the executable
@@ -80,21 +79,15 @@ endif()
 # Add json-c include directory
 target_include_directories(rpmsg_inference_example PRIVATE ${JSON_C_INCLUDE_DIRS})
 
-# Find readline library for interactive mode with command line editing
-find_library(READLINE_LIB readline REQUIRED)
-
-# Find audio libraries for WAV file processing and playback
+# Find audio libraries for WAV file processing
 find_library(SNDFILE_LIB sndfile REQUIRED)
-find_library(ALSA_LIB asound REQUIRED)
 
 # Link with required libraries
 target_link_libraries(rpmsg_inference_example
     ${TVM_RUNTIME_LIB}
     ti_rpmsg_dma
     ${JSON_C_LIBRARIES}
-    ${READLINE_LIB}
     ${SNDFILE_LIB}
-    ${ALSA_LIB}
     pthread
     dl
 )
@@ -136,8 +129,8 @@ install(TARGETS tvm_model_daemon DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES
 ${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_stft_istft.json
 ${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_tvm_inference.json
-${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_audio_enhancement.json
-${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_audio_classification.json
+${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_speech_enhancement.json
+${CMAKE_CURRENT_SOURCE_DIR}/json_files/pipeline_speech_classification.json
 DESTINATION ${CMAKE_INSTALL_DATADIR}/tvm_inference/json)
 
 # Install input files to /usr/share/tvm_inference/input/

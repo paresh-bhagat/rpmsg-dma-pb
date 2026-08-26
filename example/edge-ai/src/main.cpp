@@ -40,7 +40,7 @@ void print_usage(std::string_view program)
         << "  " << program << " --help                   Show this help\n\n"
         << "Examples:\n"
         << "  " << program << " pipeline_tvm_inference.json\n"
-        << "  " << program << " pipeline_audio_enhancement.json --debug\n";
+        << "  " << program << " pipeline_speech_enhancement.json --debug\n";
 }
 
 } // namespace

@@ -11,11 +11,8 @@ extern "C" {
 }
 
 /**
- * @brief Generic Task client for communicating with DSP Generic Service
- *
- * Handles communication with the Generic Service running on DSP endpoint 13.
- * Message type determines which struct and processing logic to use.
- * Uses zero-copy approach with TVM shared memory regions.
+ * @brief Client for communicating with the DSP generic service over RPMsg.
+ * DSP endpoint and proc_id are configured at initialize() time via JSON pipeline config.
  */
 class DspTaskClient {
 public:
@@ -35,41 +32,11 @@ public:
      * @param max_output_size Maximum output buffer size in bytes
      * @return true on success, false on failure
      */
-    bool initialize(int proc_id, int endpoint,
-                    uint32_t max_input_size = 1024*1024,
-                    uint32_t max_output_size = 1024*1024);
-
-    /**
-     * @brief Generic processing function
-     * @param message_type Message type string (determines struct and processing)
-     * @param input_data Input data buffer (not used in zero-copy mode)
-     * @param input_size Size of input data in bytes
-     * @param output_data Output data buffer (not used in zero-copy mode)
-     * @param output_size Size of output buffer in bytes
-     * @return ProcessingResult with status and information
-     */
-    ProcessingResult process(const std::string& message_type,
-                           void* input_data,
-                           uint32_t input_size,
-                           void* output_data,
-                           uint32_t output_size,
-                           const std::map<std::string, std::string>& parameters = {});
+    bool initialize(int proc_id, int endpoint);
 
     ProcessingResult process(
         const std::string& message_type,
         const std::map<std::string, std::string>& parameters = {});
-
-    /**
-     * @brief Get status from the Generic Service
-     * @return ProcessingResult with service statistics
-     */
-    ProcessingResult get_service_status();
-
-    /**
-     * @brief Ping the Generic Service
-     * @return true if service responds, false otherwise
-     */
-    bool ping_service();
 
     /**
      * @brief Shutdown and cleanup
@@ -93,9 +60,6 @@ private:
     // Internal methods
     bool open_rpmsg_device();
     void close_rpmsg_device();
-    bool allocate_shared_buffers();
-    void free_shared_buffers();
-    std::string get_error_string(int32_t error_code);
 };
 
 #endif // DSP_TASK_CLIENT_H

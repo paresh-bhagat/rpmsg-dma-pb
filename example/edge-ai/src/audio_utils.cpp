@@ -31,8 +31,7 @@ bool loadAudioFile(const std::string& filename, std::vector<int16_t>& audio_data
         return false;
     }
 
-    std::cout << "[App] Audio file info: " << (sfinfo.frames / 160) << " GCRN frames ("
-              << sfinfo.frames << " samples), "
+    std::cout << "[App] Audio file info: " << sfinfo.frames << " samples, "
               << sfinfo.samplerate << "Hz, " << sfinfo.channels << " channel(s)" << std::endl;
 
     // Read all audio data
@@ -78,8 +77,7 @@ bool saveAudioFile(const std::string& filename, const std::vector<int16_t>& audi
     }
 
     std::cout << "[App] Saving audio to: " << filename << std::endl;
-    std::cout << "[App] Output file info: " << (audio_data.size() / 160) << " GCRN frames ("
-              << audio_data.size() << " samples), "
+    std::cout << "[App] Output file info: " << audio_data.size() << " samples, "
               << sfinfo.samplerate << "Hz, " << sfinfo.channels << " channel(s)" << std::endl;
 
     // Write audio data to file
@@ -91,8 +89,7 @@ bool saveAudioFile(const std::string& filename, const std::vector<int16_t>& audi
         return false;
     }
 
-    std::cout << "[App] Successfully saved " << (frames_written / 160) << " GCRN frames ("
-              << frames_written << " samples) to " << filename << std::endl;
+    std::cout << "[App] Successfully saved " << frames_written << " samples to " << filename << std::endl;
     std::cout << "[App] Duration: "
               << (static_cast<double>(frames_written) / sfinfo.samplerate)
               << " seconds" << std::endl;

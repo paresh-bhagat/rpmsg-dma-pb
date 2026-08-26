@@ -1,6 +1,6 @@
 {
-  "pipeline_type": "audio_enhancement",
-  "description": "GCRN 3-stage audio pipeline: STFT analyze -> TVM inference -> ISTFT synthesize",
+  "pipeline_type": "speech_enhancement",
+  "description": "GCRN 3-stage speech pipeline: STFT analyze -> TVM inference -> ISTFT synthesize",
   "input_file": "/usr/share/tvm_inference/input/input_audio.wav",
   "artifacts_path": "/usr/share/tvm_inference/artifacts/",
   "dsp_config": {

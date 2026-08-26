@@ -35,37 +35,49 @@ struct c7x_msg_hdr {
     int32_t  status;
 };
 
-struct stft_istft_msg {
+/*
+ * Generic DSP message — flat payload, 5 x uint32_t after the header.
+ * Wire size is always fixed: sizeof(c7x_msg_hdr) + 5 * sizeof(uint32_t).
+ *
+ * Field mapping by message type:
+ *
+ *  param  | C7X_MSG_STFT_ANALYZE      | C7X_MSG_ISTFT_SYNTHESIZE  | C7X_DEINTERLEAVE_MSG_ANALYZE
+ *  -------|---------------------------|---------------------------|-----------------------------
+ *  param0 | selected_model            | selected_model            | input_buffer  (phys addr)
+ *  param1 | input_buffer  (phys addr) | input_buffer  (phys addr) | output_buffer (phys addr)
+ *  param2 | output_buffer (phys addr) | output_buffer (phys addr) | input_frame
+ *  param3 | input_frame               | input_frame               | fft_size
+ *  param4 | output_frame              | output_frame              | flag (0=deinterleave, 1=interleave)
+ *
+ * Note: param0 maps differently per message type because the firmware
+ * STFT/ISTFT and utils structs have different layouts (see table above).
+ *
+ * To add a new message type:
+ *   1. Add its opcodes to c7x_msg_type below
+ *   2. Add a column to this table
+ *   3. Add a new else-if branch in DspTaskClient::process()
+ *   4. Set unused params to 0
+ */
+struct dsp_msg {
     struct c7x_msg_hdr hdr;
-    uint32_t selected_model; /* ModelId: MODEL_DCCRN=0, MODEL_GTCRN=1, MODEL_GCRN=2,
-                              *          MODEL_VGGISH=3, MODEL_YAMNET=4 (see model_config.h) */
-    uint32_t input_buffer;
-    uint32_t output_buffer;
-    uint32_t input_frame;
-    uint32_t output_frame;
+    uint32_t param0;
+    uint32_t param1;
+    uint32_t param2;
+    uint32_t param3;
+    uint32_t param4;
 };
 
 enum c7x_msg_type {
-    C7X_MSG_STFT_ANALYZE = 0x1020,
-    C7X_MSG_STFT_ANALYZE_RESP = 0x2020,
-    C7X_MSG_ISTFT_SYNTHESIZE = 0x1030,
-    C7X_MSG_ISTFT_SYNTHESIZE_RESP = 0x2030,
-    C7X_DEINTERLEAVE_MSG_ANALYZE = 0x1040,
+    C7X_MSG_STFT_ANALYZE              = 0x1020,
+    C7X_MSG_STFT_ANALYZE_RESP         = 0x2020,
+    C7X_MSG_ISTFT_SYNTHESIZE          = 0x1030,
+    C7X_MSG_ISTFT_SYNTHESIZE_RESP     = 0x2030,
+    C7X_DEINTERLEAVE_MSG_ANALYZE      = 0x1040,
     C7X_DEINTERLEAVE_MSG_ANALYZE_RESP = 0x2040
 };
 
-struct deinterleave_interleave_msg {
-    struct c7x_msg_hdr hdr;
-    uint32_t input_buffer;
-    uint32_t output_buffer;
-    uint32_t input_frame;
-    uint32_t fft_size;
-    uint32_t flag;              // 0: deinterleave, 1: interleave
-};
-
 static_assert(sizeof(c7x_msg_hdr) == 16);
-static_assert(sizeof(stft_istft_msg) == 36);
-static_assert(sizeof(deinterleave_interleave_msg) == 36);
+static_assert(sizeof(dsp_msg) == sizeof(c7x_msg_hdr) + 5 * sizeof(uint32_t));
 
 enum c7x_status {
     C7X_STATUS_SUCCESS = 0,
@@ -97,11 +109,8 @@ DspTaskClient::~DspTaskClient()
     shutdown();
 }
 
-bool DspTaskClient::initialize(int proc_id, int endpoint,
-                               uint32_t max_input_size, uint32_t max_output_size)
+bool DspTaskClient::initialize(int proc_id, int endpoint)
 {
-    (void)max_input_size;
-    (void)max_output_size;
     if (initialized_) {
         return true;
     }
@@ -134,18 +143,10 @@ void DspTaskClient::close_rpmsg_device()
     }
 }
 
-DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& message_type,
-                                                             void* input_data,
-                                                             uint32_t input_size,
-                                                             void* output_data,
-                                                             uint32_t output_size,
-                                                             const std::map<std::string, std::string>& parameters)
+DspTaskClient::ProcessingResult DspTaskClient::process(
+    const std::string& message_type,
+    const std::map<std::string, std::string>& parameters)
 {
-    (void)input_data;
-    (void)input_size;
-    (void)output_data;
-    (void)output_size;
-
     ProcessingResult result = {};
     result.success = false;
 
@@ -157,26 +158,26 @@ DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& messag
     try {
     // Determine message type and send appropriate struct
     if (message_type == "C7X_MSG_STFT_ANALYZE") {
-        struct stft_istft_msg req = {};
-        req.hdr.type = C7X_MSG_STFT_ANALYZE;
-        req.hdr.seq = sequence_number_++;
-        req.hdr.len = sizeof(struct stft_istft_msg);
+        struct dsp_msg req = {};
+        req.hdr.type   = C7X_MSG_STFT_ANALYZE;
+        req.hdr.seq    = sequence_number_++;
+        req.hdr.len    = sizeof(struct dsp_msg);
         req.hdr.status = 0;
 
-        req.selected_model = parameter_value(parameters, "selected_model", 0);
-        req.input_buffer = parameter_value(parameters, "input_buffer", 0, 16);
-        req.output_buffer = parameter_value(parameters, "output_buffer", 0, 16);
-        req.input_frame = parameter_value(parameters, "input_frame", 0);
-        req.output_frame = parameter_value(parameters, "output_frame", 0);
+        req.param0 = parameter_value(parameters, "selected_model", 0);     /* selected_model */
+        req.param1 = parameter_value(parameters, "input_buffer",  0, 16);  /* input_buffer   */
+        req.param2 = parameter_value(parameters, "output_buffer", 0, 16);  /* output_buffer  */
+        req.param3 = parameter_value(parameters, "input_frame",   0);      /* input_frame    */
+        req.param4 = parameter_value(parameters, "output_frame",  0);      /* output_frame   */
 #ifdef DEBUG
         std::cout << "[GenericClient] STFT_ANALYZE - Sending to firmware:" << std::endl;
-        std::cout << "[GenericClient]   selected_model=" << req.selected_model << std::endl;
-        std::cout << "[GenericClient]   input_buffer=0x" << std::hex << req.input_buffer << std::endl;
-        std::cout << "[GenericClient]   output_buffer=0x" << std::hex << req.output_buffer << std::endl;
-        std::cout << "[GenericClient]   input_frame=" << std::dec << req.input_frame << " frames" << std::endl;
-        std::cout << "[GenericClient]   output_frame=" << std::dec << req.output_frame << " frames" << std::endl;
+        std::cout << "[GenericClient]   selected_model=" << req.param0 << std::endl;
+        std::cout << "[GenericClient]   input_buffer=0x"  << std::hex << req.param1 << std::endl;
+        std::cout << "[GenericClient]   output_buffer=0x" << std::hex << req.param2 << std::endl;
+        std::cout << "[GenericClient]   input_frame="  << std::dec << req.param3 << " frames" << std::endl;
+        std::cout << "[GenericClient]   output_frame=" << std::dec << req.param4 << " frames" << std::endl;
 #endif
-        struct stft_istft_msg resp = {};
+        struct dsp_msg resp = {};
         if (!exchange_message(rpmsg_fd_, req, resp)) {
             result.error_message = "STFT analyze message exchange failed";
             return result;
@@ -188,9 +189,9 @@ DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& messag
         }
 #ifdef DEBUG
         std::cout << "[GenericClient] STFT_ANALYZE - Firmware responded:" << std::endl;
-        std::cout << "[GenericClient]   status=" << resp.hdr.status << std::endl;
-        std::cout << "[GenericClient]   resp.input_frame=" << resp.input_frame << " frames" << std::endl;
-        std::cout << "[GenericClient]   resp.output_frame=" << resp.output_frame << " frames" << std::endl;
+        std::cout << "[GenericClient]   status="       << resp.hdr.status << std::endl;
+        std::cout << "[GenericClient]   input_frame="  << resp.param3 << " frames" << std::endl;
+        std::cout << "[GenericClient]   output_frame=" << resp.param4 << " frames" << std::endl;
 #endif
         if (resp.hdr.status != C7X_STATUS_SUCCESS) {
             result.error_message = "DSP STFT analyze failed";
@@ -198,30 +199,30 @@ DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& messag
         }
 
         result.success = true;
-        result.input_size = resp.input_frame;
-        result.output_size = resp.output_frame;
+        result.input_size  = resp.param3;   /* input_frame  */
+        result.output_size = resp.param4;   /* output_frame */
 
     } else if (message_type == "C7X_MSG_ISTFT_SYNTHESIZE") {
-        struct stft_istft_msg req = {};
-        req.hdr.type = C7X_MSG_ISTFT_SYNTHESIZE;
-        req.hdr.seq = sequence_number_++;
-        req.hdr.len = sizeof(struct stft_istft_msg);
+        struct dsp_msg req = {};
+        req.hdr.type   = C7X_MSG_ISTFT_SYNTHESIZE;
+        req.hdr.seq    = sequence_number_++;
+        req.hdr.len    = sizeof(struct dsp_msg);
         req.hdr.status = 0;
 
-        req.selected_model = parameter_value(parameters, "selected_model", 0);
-        req.input_buffer = parameter_value(parameters, "input_buffer", 0, 16);
-        req.output_buffer = parameter_value(parameters, "output_buffer", 0, 16);
-        req.input_frame = parameter_value(parameters, "input_frame", 0);
-        req.output_frame = parameter_value(parameters, "output_frame", 0);
+        req.param0 = parameter_value(parameters, "selected_model", 0);     /* selected_model */
+        req.param1 = parameter_value(parameters, "input_buffer",  0, 16);  /* input_buffer   */
+        req.param2 = parameter_value(parameters, "output_buffer", 0, 16);  /* output_buffer  */
+        req.param3 = parameter_value(parameters, "input_frame",   0);      /* input_frame    */
+        req.param4 = parameter_value(parameters, "output_frame",  0);      /* output_frame   */
 #ifdef DEBUG
         std::cout << "[GenericClient] ISTFT_SYNTHESIZE - Sending to firmware:" << std::endl;
-        std::cout << "[GenericClient]   selected_model=" << req.selected_model << std::endl;
-        std::cout << "[GenericClient]   input_buffer=0x" << std::hex << req.input_buffer << std::endl;
-        std::cout << "[GenericClient]   output_buffer=0x" << std::hex << req.output_buffer << std::endl;
-        std::cout << "[GenericClient]   input_frame=" << std::dec << req.input_frame << " frames" << std::endl;
-        std::cout << "[GenericClient]   output_frame=" << std::dec << req.output_frame << " frames" << std::endl;
+        std::cout << "[GenericClient]   selected_model=" << req.param0 << std::endl;
+        std::cout << "[GenericClient]   input_buffer=0x"  << std::hex << req.param1 << std::endl;
+        std::cout << "[GenericClient]   output_buffer=0x" << std::hex << req.param2 << std::endl;
+        std::cout << "[GenericClient]   input_frame="  << std::dec << req.param3 << " frames" << std::endl;
+        std::cout << "[GenericClient]   output_frame=" << std::dec << req.param4 << " frames" << std::endl;
 #endif
-        struct stft_istft_msg resp = {};
+        struct dsp_msg resp = {};
         if (!exchange_message(rpmsg_fd_, req, resp)) {
             result.error_message = "ISTFT synthesize message exchange failed";
             return result;
@@ -233,9 +234,9 @@ DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& messag
         }
 #ifdef DEBUG
         std::cout << "[GenericClient] ISTFT_SYNTHESIZE - Firmware responded:" << std::endl;
-        std::cout << "[GenericClient]   status=" << resp.hdr.status << std::endl;
-        std::cout << "[GenericClient]   resp.input_frame=" << resp.input_frame << " frames" << std::endl;
-        std::cout << "[GenericClient]   resp.output_frame=" << resp.output_frame << " frames" << std::endl;
+        std::cout << "[GenericClient]   status="       << resp.hdr.status << std::endl;
+        std::cout << "[GenericClient]   input_frame="  << resp.param3 << " frames" << std::endl;
+        std::cout << "[GenericClient]   output_frame=" << resp.param4 << " frames" << std::endl;
 #endif
         if (resp.hdr.status != C7X_STATUS_SUCCESS) {
             result.error_message = "DSP ISTFT synthesize failed";
@@ -243,23 +244,23 @@ DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& messag
         }
 
         result.success = true;
-        result.input_size = resp.input_frame;
-        result.output_size = resp.output_frame;
+        result.input_size  = resp.param3;   /* input_frame  */
+        result.output_size = resp.param4;   /* output_frame */
 
     } else if (message_type == "C7X_DEINTERLEAVE_MSG_ANALYZE") {
-        struct deinterleave_interleave_msg req = {};
+        struct dsp_msg req = {};
         req.hdr.type   = C7X_DEINTERLEAVE_MSG_ANALYZE;
         req.hdr.seq    = sequence_number_++;
-        req.hdr.len    = sizeof(struct deinterleave_interleave_msg);
+        req.hdr.len    = sizeof(struct dsp_msg);
         req.hdr.status = 0;
 
-        req.input_buffer = parameter_value(parameters, "input_buffer", 0, 16);
-        req.output_buffer = parameter_value(parameters, "output_buffer", 0, 16);
-        req.input_frame = parameter_value(parameters, "input_frame", 0);
-        req.fft_size = parameter_value(parameters, "fft_size", 0);
-        req.flag = parameter_value(parameters, "flag", 0);
+        req.param0 = parameter_value(parameters, "input_buffer",  0, 16);   /* input_buffer   */
+        req.param1 = parameter_value(parameters, "output_buffer", 0, 16);   /* output_buffer  */
+        req.param2 = parameter_value(parameters, "input_frame",   0);       /* input_frame    */
+        req.param3 = parameter_value(parameters, "fft_size",      0);       /* fft_size       */
+        req.param4 = parameter_value(parameters, "flag",          0);       /* flag           */
 
-        struct deinterleave_interleave_msg resp = {};
+        struct dsp_msg resp = {};
         if (!exchange_message(rpmsg_fd_, req, resp)) {
             result.error_message = "Layout conversion message exchange failed";
             return result;
@@ -276,8 +277,8 @@ DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& messag
         }
 
         result.success = true;
-        result.input_size  = resp.input_frame;
-        result.output_size = resp.input_frame;
+        result.input_size  = resp.param2;   /* input_frame */
+        result.output_size = resp.param2;   /* input_frame */
 
     } else {
         result.error_message = "Unknown message type: " + message_type;
@@ -291,42 +292,10 @@ DspTaskClient::ProcessingResult DspTaskClient::process(const std::string& messag
     return result;
 }
 
-DspTaskClient::ProcessingResult DspTaskClient::process(
-    const std::string& message_type,
-    const std::map<std::string, std::string>& parameters)
-{
-    return process(message_type, nullptr, 0, nullptr, 0, parameters);
-}
-
-DspTaskClient::ProcessingResult DspTaskClient::get_service_status()
-{
-    ProcessingResult result = {};
-    result.success = initialized_;
-    if (!initialized_) {
-        result.error_message = "Client not initialized";
-    }
-    return result;
-}
-
-bool DspTaskClient::ping_service()
-{
-    // STFT service doesn't have separate ping - just return initialized status
-    return initialized_;
-}
-
 void DspTaskClient::shutdown()
 {
     if (initialized_) {
         close_rpmsg_device();
         initialized_ = false;
-    }
-}
-
-std::string DspTaskClient::get_error_string(int32_t error_code)
-{
-    switch (error_code) {
-        case C7X_STATUS_SUCCESS: return "Success";
-        case C7X_STATUS_ERROR: return "Error";
-        default: return "Unknown error";
     }
 }

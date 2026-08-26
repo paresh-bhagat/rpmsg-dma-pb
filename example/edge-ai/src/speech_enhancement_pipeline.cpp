@@ -1,4 +1,4 @@
-#include "audio_enhancement_pipeline.h"
+#include "speech_enhancement_pipeline.h"
 #include "pipeline_common.h"
 #include "audio_utils.h"
 #include <algorithm>
@@ -30,7 +30,7 @@ size_t require_param(const std::map<std::string, std::string>& params,
 
 } // namespace
 
-PipelineManager::CommandResult run_audio_enhancement_pipeline(
+PipelineManager::CommandResult run_speech_enhancement_pipeline(
     PipelineManager::State& state,
     DspTaskClient& dsp_client,
     TvmInferenceClient& tvm_client,
@@ -61,7 +61,7 @@ PipelineManager::CommandResult run_audio_enhancement_pipeline(
         }
 
         if (!stft_stage_ptr || !istft_stage_ptr || !deint_stage_ptr || !inter_stage_ptr)
-            throw PipelineError{"audio_enhancement pipeline requires STFT, deinterleave, interleave and ISTFT stages"};
+            throw PipelineError{"speech_enhancement pipeline requires STFT, deinterleave, interleave and ISTFT stages"};
 
         // Read loop/buffer parameters from STFT stage (drives STFT-side buffers and loop)
         const auto& sp = stft_stage_ptr->parameters;

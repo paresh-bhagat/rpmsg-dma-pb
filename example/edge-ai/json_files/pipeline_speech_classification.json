@@ -1,6 +1,6 @@
 {
-  "pipeline_type": "audio_classification",
-  "description": "YAMNet: audio -> STFT log-mel spectrogram -> mel_features_output.bin",
+  "pipeline_type": "speech_classification",
+  "description": "YAMNet: speech -> STFT log-mel spectrogram -> mel_features_output.bin",
   "input_file": "/usr/share/tvm_inference/input/input_audio.wav",
   "dsp_config": {
     "proc_id": 8,

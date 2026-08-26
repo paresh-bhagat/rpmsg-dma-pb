@@ -2,7 +2,6 @@
 #include <iostream>
 #include <fstream>
 #include <filesystem>
-#include <vector>
 
 namespace {
 
@@ -27,32 +26,6 @@ bool saveTensorFile(const std::string& filename, const std::vector<float>& tenso
 
     std::cout << "[App] Successfully saved " << tensor_data.size() << " float values ("
               << (tensor_data.size() * sizeof(float)) << " bytes) to " << filename << std::endl;
-
-    return true;
-}
-
-bool loadBinTensor(const std::string& filename, std::vector<float>& tensor_data)
-{
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        std::cout << "[App] Error: Cannot open BIN file: " << filename << std::endl;
-        return false;
-    }
-
-    const std::streamsize size = file.tellg();
-    if (size <= 0 || size % static_cast<std::streamsize>(sizeof(float)) != 0) {
-        std::cout << "[App] Error: BIN file is not a non-empty float32 tensor" << std::endl;
-        return false;
-    }
-    file.seekg(0, std::ios::beg);
-
-    const size_t num_floats = static_cast<size_t>(size) / sizeof(float);
-    tensor_data.resize(num_floats);
-
-    if (!file.read(reinterpret_cast<char*>(tensor_data.data()), size)) {
-        std::cout << "[App] Error: Failed to read BIN file" << std::endl;
-        return false;
-    }
 
     return true;
 }
