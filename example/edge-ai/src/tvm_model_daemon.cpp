@@ -19,6 +19,8 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <cerrno>
 #include <csignal>
 #include <cstring>
 #include <chrono>
@@ -27,6 +29,99 @@
 #include <vector>
 
 static constexpr const char* DEFAULT_ARTIFACTS = "/usr/share/tvm_inference/artifacts/";
+
+static constexpr const char* C7X_FW_LINK      = "/lib/firmware/am62d-c71_0-fw";
+static constexpr const char* C7X_FW_TARGET    = "/lib/firmware/ti-ipc/am62dxx/dsp_edgeai.c75ss0-0.release.strip.out";
+static constexpr const char* RPROC_STATE      = "/sys/class/remoteproc/remoteproc0/state";
+static constexpr int         BOOT_TIMEOUT_S   = 60;
+static constexpr int         STOP_TIMEOUT_S   = 1;
+
+static std::string read_sysfs(const char* path) {
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return "";
+    char buf[64] = {};
+    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+    if (n <= 0) return "";
+    if (n > 0 && buf[n - 1] == '\n') buf[n - 1] = '\0';
+    return std::string(buf);
+}
+
+static bool write_sysfs(const char* path, const char* value) {
+    int fd = ::open(path, O_WRONLY);
+    if (fd < 0) return false;
+    ssize_t n = ::write(fd, value, std::strlen(value));
+    ::close(fd);
+    return n > 0;
+}
+
+static bool fw_link_correct() {
+    char target[512] = {};
+    ssize_t n = ::readlink(C7X_FW_LINK, target, sizeof(target) - 1);
+    if (n < 0) return false;
+    target[n] = '\0';
+    return std::strcmp(target, C7X_FW_TARGET) == 0;
+}
+
+/* Ensure C7x firmware symlink points to the edgeai binary and C7x is running.
+ * If the symlink is wrong: stop C7x, fix symlink, start C7x.
+ * If the symlink is correct but C7x is not running: start C7x.
+ * Polls until running state or BOOT_TIMEOUT_S seconds. */
+static bool wait_for_c7x() {
+    bool need_restart = false;
+
+    if (!fw_link_correct()) {
+        std::cout << "[daemon] C7x firmware symlink incorrect — fixing\n";
+
+        std::string state = read_sysfs(RPROC_STATE);
+        if (state == "running" || state == "attached") {
+            std::cout << "[daemon] Stopping C7x for firmware update...\n";
+            if (!write_sysfs(RPROC_STATE, "stop")) {
+                std::cerr << "[daemon] Failed to stop C7x: " << std::strerror(errno) << '\n';
+                return false;
+            }
+            for (int i = 0; i < STOP_TIMEOUT_S; ++i) {
+                ::sleep(1);
+                if (read_sysfs(RPROC_STATE) == "offline") break;
+            }
+        }
+
+        ::unlink(C7X_FW_LINK);
+        if (::symlink(C7X_FW_TARGET, C7X_FW_LINK) != 0) {
+            std::cerr << "[daemon] Failed to create firmware symlink: " << std::strerror(errno) << '\n';
+            return false;
+        }
+        std::cout << "[daemon] Firmware symlink updated -> " << C7X_FW_TARGET << '\n';
+        need_restart = true;
+    }
+
+    std::string state = read_sysfs(RPROC_STATE);
+    if (state != "running") {
+        std::cout << "[daemon] Starting C7x...\n";
+        if (!write_sysfs(RPROC_STATE, "start")) {
+            std::cerr << "[daemon] Failed to start C7x: " << std::strerror(errno) << '\n';
+            return false;
+        }
+        need_restart = true;
+    }
+
+    if (!need_restart && state == "running") {
+        std::cout << "[daemon] C7x firmware OK and already running\n";
+        return true;
+    }
+
+    std::cout << "[daemon] Waiting for C7x to reach 'running' state (up to "
+              << BOOT_TIMEOUT_S << "s)...\n";
+    for (int i = 0; i < BOOT_TIMEOUT_S; ++i) {
+        ::sleep(1);
+        if (read_sysfs(RPROC_STATE) == "running") {
+            std::cout << "[daemon] C7x is running\n";
+            return true;
+        }
+    }
+    std::cerr << "[daemon] Timeout: C7x did not reach 'running' state\n";
+    return false;
+}
 
 namespace {
 
@@ -134,6 +229,11 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[daemon] Loading TVM artifacts from: " << artifacts << '\n';
 
+    if (!wait_for_c7x()) {
+        std::cerr << "[daemon] C7x not ready — aborting\n";
+        return 1;
+    }
+
     TvmInferenceClient tvm;
     tvm.disable_daemon();               /* must not try to connect to itself */
     tvm.set_input_shape({1, 2, 401, 161});
@@ -171,9 +271,7 @@ int main(int argc, char* argv[]) {
             if (g_running) perror("accept");
             break;
         }
-        std::cout << "[daemon] Client connected\n";
         handle_client(cfd, tvm);
-        std::cout << "[daemon] Client done\n";
     }
 
     ::unlink(TvmDaemon::SOCKET_PATH);

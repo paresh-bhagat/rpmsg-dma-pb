@@ -216,6 +216,7 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
 
                 dma_buf1.begin_cpu_access();
                 std::fill_n(dma_buf1.data<std::byte>(), audio_batch_bytes, std::byte{});
+                audio_stream.send_frame(0, dma_buf1.data<std::byte>(), audio_bytes);
                 if (audio_offset < audio_data.size()) {
                     const size_t available = std::min(samples_this_batch,
                                                       audio_data.size() - audio_offset);
@@ -223,7 +224,6 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                                 available, dma_buf1.data<int16_t>());
                 }
                 dma_buf1.end_cpu_access();
-                audio_stream.send_frame(0, dma_buf1.data<std::byte>(), audio_bytes);
 
                 auto params = stft_stage_ptr->parameters;
                 params["input_buffer"]  = hex_address(dma_buf1->phys_addr);
@@ -363,6 +363,7 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                 }
 
                 std::copy_n(out_ptr, samples_this_batch, std::back_inserter(chunk_output));
+                audio_stream.send_frame(1, out_ptr, samples_this_batch * sizeof(int16_t));
                 dma_buf4.end_cpu_access();
             }
             double t_istft_ms = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -374,9 +375,6 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                 std::copy(chunk_output.begin() + static_cast<std::ptrdiff_t>(lo_sample),
                           chunk_output.begin() + static_cast<std::ptrdiff_t>(keep_end),
                           std::back_inserter(processed_audio_data));
-                audio_stream.send_frame(1,
-                    chunk_output.data() + lo_sample,
-                    (keep_end - lo_sample) * sizeof(int16_t));
             }
 
             double t_chunk_ms = std::chrono::duration_cast<std::chrono::microseconds>(
