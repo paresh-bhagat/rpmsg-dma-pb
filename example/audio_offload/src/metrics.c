@@ -14,7 +14,10 @@ float get_cpu_load()
 	long user, nice, system, idle;
 	FILE *fp = fopen("/proc/stat", "r");
 	if (!fp) return -1;
-	fscanf(fp, "cpu %ld %ld %ld %ld", &user, &nice, &system, &idle);
+	if (fscanf(fp, "cpu %ld %ld %ld %ld", &user, &nice, &system, &idle) != 4) {
+		fclose(fp);
+		return -1;
+	}
 	fclose(fp);
 	long total = (user-last_user)+(nice-last_nice)+(system-last_system);
 	long total_all = total + (idle-last_idle);

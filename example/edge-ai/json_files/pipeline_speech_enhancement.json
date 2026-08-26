@@ -1,7 +1,8 @@
 {
-  "pipeline_type": "stft_istft",
-  "description": "STFT round-trip pipeline: STFT analyze -> deinterleave -> interleave -> ISTFT synthesize",
+  "pipeline_type": "speech_enhancement",
+  "description": "GCRN 3-stage speech pipeline: STFT analyze -> TVM inference -> ISTFT synthesize",
   "input_file": "/usr/share/tvm_inference/input/input_audio.wav",
+  "artifacts_path": "/usr/share/tvm_inference/artifacts/",
   "dsp_config": {
     "proc_id": 8,
     "endpoint": 13
@@ -26,6 +27,14 @@
       "parameters": {
         "fft_size": 320,
         "flag": 0
+      }
+    },
+    {
+      "stage_id": "tvm_inference",
+      "service": "tvm",
+      "message_type": "TVM_INFERENCE",
+      "parameters": {
+        "input_shape": "1,2,401,161"
       }
     },
     {
