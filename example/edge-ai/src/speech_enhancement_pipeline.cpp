@@ -403,6 +403,7 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
         if (!saveAudioFile(output_filename, processed_audio_data))
             throw PipelineError{"Failed to save output file"};
         std::cout << "[App] Saved to " << output_filename << std::endl;
+	std::cout << "PASSED" << std::endl;
         return PipelineManager::CommandResult::SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "[App] Pipeline failed: " << error.what() << std::endl;

@@ -70,6 +70,7 @@ PipelineManager::CommandResult run_tvm_pipeline(
 
     std::cout << "[App] Output saved to: " << output_file << std::endl;
     std::cout << "[App] Pipeline completed successfully" << std::endl;
+    std::cout << "PASSED" << std::endl;
 
     return PipelineManager::CommandResult::SUCCESS;
 }
