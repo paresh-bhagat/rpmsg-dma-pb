@@ -38,6 +38,9 @@ public:
         std::string description;
         std::string input_file;
         std::string artifacts_path;
+        std::string labels_path;      // optional — classification pipelines only
+        size_t      num_classes{0};   // optional — 0 = derive from model output
+        int         overlap_frames{-1}; // optional — enhancement only; -1 = no overlap
         std::vector<PipelineStage> stages;
         DspConfig dsp_config;
         bool loaded;
@@ -52,7 +55,6 @@ public:
     };
 
     struct State {
-        bool artifacts_loaded;
         PipelineConfig pipeline_config;
         std::string current_pipeline_file;
         std::vector<std::string> tvm_artifacts_paths;
@@ -67,7 +69,7 @@ public:
     // Path where the currently-loaded model artifacts path is persisted across runs
     static constexpr const char* MODEL_CACHE_FILE = "/var/lib/tvm_inference/loaded_model";
     // Default artifacts loaded at boot via --preload
-    static constexpr const char* DEFAULT_ARTIFACTS_PATH = "/usr/share/tvm_inference/artifacts/";
+    static constexpr const char* DEFAULT_ARTIFACTS_PATH = "/usr/share/tvm_inference/artifacts/gcrn";
 
     PipelineManager();
     ~PipelineManager();
