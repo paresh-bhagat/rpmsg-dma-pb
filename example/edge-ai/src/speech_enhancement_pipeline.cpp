@@ -1,6 +1,7 @@
 #include "speech_enhancement_pipeline.h"
 #include "pipeline_common.h"
 #include "audio_utils.h"
+#include "speech_chunk_range.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -50,7 +51,6 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
         const size_t MODEL_ELEMS    = require_param(sp, "model_elems",  stft_stage_ptr->stage_id.c_str());
         const size_t TOTAL_FRAMES   = require_param(sp, "total_frames", stft_stage_ptr->stage_id.c_str());
         const size_t BATCH_N        = require_param(sp, "batch_n",      stft_stage_ptr->stage_id.c_str());
-        const size_t PAD_FRAMES     = TOTAL_FRAMES % BATCH_N;
         const size_t NUM_BATCHES    = (TOTAL_FRAMES + BATCH_N - 1) / BATCH_N;
 
         // Read parameters from ISTFT stage (drives ISTFT-side buffers — TVM output may differ)
@@ -60,11 +60,18 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
         const size_t ISTFT_TOTAL_FRAMES = require_param(ip, "total_frames", istft_stage_ptr->stage_id.c_str());
         const size_t ISTFT_BATCH_N      = require_param(ip, "batch_n",      istft_stage_ptr->stage_id.c_str());
 
-        // STFT-side buffer sizes (buf1, buf2, buf5)
+        if (state.pipeline_config.overlap_frames < -1 ||
+            (state.pipeline_config.overlap_frames > 0 &&
+             static_cast<size_t>(state.pipeline_config.overlap_frames) >= TOTAL_FRAMES))
+            throw PipelineError{"overlap_frames must be -1 (disabled) or in [0, total_frames)"};
+        if (ISTFT_HOP_SIZE != HOP_SIZE || ISTFT_TOTAL_FRAMES != TOTAL_FRAMES)
+            throw PipelineError{"Speech reconstruction requires matching STFT/ISTFT hop_size and total_frames"};
+
+        // STFT-side payload sizes
         const size_t audio_batch_bytes       = BATCH_N      * HOP_SIZE    * sizeof(int16_t);
         const size_t spectral_stft_bytes     = TOTAL_FRAMES * MODEL_ELEMS * sizeof(float);
 
-        // ISTFT-side buffer sizes (buf3, buf4, buf6) — based on TVM output shape
+        // ISTFT-side payload sizes — based on TVM output shape
         const size_t audio_istft_batch_bytes = ISTFT_BATCH_N      * ISTFT_HOP_SIZE    * sizeof(int16_t);
         const size_t spectral_istft_bytes    = ISTFT_TOTAL_FRAMES * ISTFT_MODEL_ELEMS * sizeof(float);
 
@@ -85,38 +92,34 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                                    state.pipeline_config.dsp_config.endpoint))
             throw PipelineError{"Failed to initialize DSP Task client"};
 
-        // Allocate DMA buffers
-        // STFT-side: buf1 (audio in), buf2 (STFT out), buf5 (deinterleave out)
-        // ISTFT-side: buf3 (interleave out), buf4 (ISTFT audio out), buf6 (interleave in)
-        DmaBuffer dma_buf1{audio_batch_bytes,       "STFT input"};
-        DmaBuffer dma_buf2{spectral_stft_bytes,     "STFT output"};
-        DmaBuffer dma_buf3{spectral_istft_bytes,    "interleave output"};
-        DmaBuffer dma_buf4{audio_istft_batch_bytes, "ISTFT output"};
-        DmaBuffer dma_buf5{spectral_stft_bytes,     "deinterleave output"};
-        DmaBuffer dma_buf6{spectral_istft_bytes,    "interleave input"};
+        // Two reusable DMA allocations; every DSP process() waits for completion.
+        // A: PCM batch in -> planar STFT -> planar model output -> PCM batch out.
+        // B: interleaved STFT -> interleaved model output.
+        // De/interleave always use distinct allocations. During STFT, all spectra
+        // accumulate in B while A is refilled; during ISTFT, B stays intact while
+        // each PCM batch in A is copied into chunk_output before A is reused.
+        // The synchronous TVM call consumes A before replacing its contents.
+        // It retains no DMA views after returning.
+        const size_t work_a_bytes = std::max({audio_batch_bytes,
+                                              audio_istft_batch_bytes,
+                                              spectral_stft_bytes,
+                                              spectral_istft_bytes});
+        const size_t work_b_bytes = std::max(spectral_stft_bytes, spectral_istft_bytes);
+        DmaBuffer dma_work_a{work_a_bytes, "speech PCM / planar spectra"};
+        DmaBuffer dma_work_b{work_b_bytes, "speech interleaved spectra"};
 
-        std::cout << "[App] DMA buffers:" << std::endl;
-        std::cout << "[App]   buf1 (STFT audio in):      phys=0x" << std::hex << dma_buf1->phys_addr
-                  << std::dec << " size=" << dma_buf1->size << std::endl;
-        std::cout << "[App]   buf2 (STFT out/deint in):  phys=0x" << std::hex << dma_buf2->phys_addr
-                  << std::dec << " size=" << dma_buf2->size << std::endl;
-        std::cout << "[App]   buf3 (int out/ISTFT in):   phys=0x" << std::hex << dma_buf3->phys_addr
-                  << std::dec << " size=" << dma_buf3->size << std::endl;
-        std::cout << "[App]   buf4 (ISTFT audio out):    phys=0x" << std::hex << dma_buf4->phys_addr
-                  << std::dec << " size=" << dma_buf4->size << std::endl;
-        std::cout << "[App]   buf5 (deint out):          phys=0x" << std::hex << dma_buf5->phys_addr
-                  << std::dec << " size=" << dma_buf5->size << std::endl;
-        std::cout << "[App]   buf6 (interleave in):      phys=0x" << std::hex << dma_buf6->phys_addr
-                  << std::dec << " size=" << dma_buf6->size << std::endl;
+        std::cout << "[App] DMA buffers (reused across sequential stages):" << std::endl;
+        std::cout << "[App]   A (PCM / planar):  phys=0x" << std::hex << dma_work_a->phys_addr
+                  << std::dec << " size=" << dma_work_a->size << std::endl;
+        std::cout << "[App]   B (interleaved):   phys=0x" << std::hex << dma_work_b->phys_addr
+                  << std::dec << " size=" << dma_work_b->size << std::endl;
 
         // Chunking parameters — overlap-save only if overlap_frames set in JSON
         const bool   USE_OVERLAP     = state.pipeline_config.overlap_frames > 0;
         const size_t OVERLAP_FRAMES  = USE_OVERLAP
                                        ? static_cast<size_t>(state.pipeline_config.overlap_frames)
                                        : 0;
-        const size_t T_FRAMES        = OVERLAP_FRAMES / 2;
         const size_t HOP_FRAMES      = USE_OVERLAP ? TOTAL_FRAMES - OVERLAP_FRAMES : TOTAL_FRAMES;
-        const size_t T_SAMPLES       = T_FRAMES * HOP_SIZE;
         const size_t HOP_SAMPLES     = HOP_FRAMES * HOP_SIZE;
         const size_t CHUNK_SAMPLES   = TOTAL_FRAMES * HOP_SIZE;
 
@@ -168,11 +171,9 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
         std::vector<int16_t> processed_audio_data;
         processed_audio_data.reserve(n_samples);
 
-        uint64_t stft_out_base  = dma_buf2->phys_addr;
-        uint64_t istft_src_base = dma_buf3->phys_addr;
+        uint64_t stft_out_base  = dma_work_b->phys_addr;
+        uint64_t istft_src_base = dma_work_b->phys_addr;
 
-        std::vector<float> deint_output_data;
-        std::vector<float> inter_input_data;
         AudioStream audio_stream;
 
         auto t_total_start = std::chrono::steady_clock::now();
@@ -183,33 +184,34 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
             const size_t chunk_frame_offset   = chunk_sample_offset / HOP_SIZE;
             const size_t num_batches_chunk    = NUM_BATCHES;
 
-            // Trim-reconstruct: which output samples to keep from this chunk
-            const size_t lo_sample = (USE_OVERLAP && chunk_idx > 0)            ? T_SAMPLES     : 0;
-            const size_t hi_sample = (USE_OVERLAP && chunk_idx < n_chunks - 1) ? CHUNK_SAMPLES - T_SAMPLES : CHUNK_SAMPLES;
+            const auto keep = speech_chunk_range(chunk_idx, n_chunks, CHUNK_SAMPLES,
+                                                 OVERLAP_FRAMES, HOP_SIZE,
+                                                 original_sample_count);
+            const size_t lo_sample = keep.begin;
+            const size_t hi_sample = keep.end;
 
             auto t_chunk_start = std::chrono::steady_clock::now();
 
             // Phase 1: STFT
             auto t_stft_start = std::chrono::steady_clock::now();
             for (size_t batch_idx = 0; batch_idx < num_batches_chunk; batch_idx++) {
-                const size_t frames_this_batch  = (batch_idx < NUM_BATCHES - 1) ? BATCH_N : PAD_FRAMES;
+                const size_t frames_this_batch  = std::min(BATCH_N, TOTAL_FRAMES - batch_idx * BATCH_N);
                 const size_t samples_this_batch = frames_this_batch * HOP_SIZE;
                 const size_t audio_offset       = chunk_sample_offset + batch_idx * BATCH_N * HOP_SIZE;
                 const uint64_t spectral_offset  = batch_idx * BATCH_N * MODEL_ELEMS * sizeof(float);
 
-                dma_buf1.begin_cpu_access();
-                std::fill_n(dma_buf1.data<std::byte>(), audio_batch_bytes, std::byte{});
-                audio_stream.send_frame(0, dma_buf1.data<std::byte>(), samples_this_batch * sizeof(int16_t));
+                dma_work_a.begin_cpu_access();
+                std::fill_n(dma_work_a.data<std::byte>(), audio_batch_bytes, std::byte{});
                 if (audio_offset < audio_data.size()) {
                     const size_t available = std::min(samples_this_batch,
                                                       audio_data.size() - audio_offset);
                     std::copy_n(audio_data.begin() + static_cast<std::ptrdiff_t>(audio_offset),
-                                available, dma_buf1.data<int16_t>());
+                                available, dma_work_a.data<int16_t>());
                 }
-                dma_buf1.end_cpu_access();
+                dma_work_a.end_cpu_access();
 
                 auto params = stft_stage_ptr->parameters;
-                params["input_buffer"]  = hex_address(dma_buf1->phys_addr);
+                params["input_buffer"]  = hex_address(dma_work_a->phys_addr);
                 params["output_buffer"] = hex_address(stft_out_base + spectral_offset);
                 params["input_frame"]   = std::to_string(frames_this_batch);
                 params["output_frame"]  = std::to_string(frames_this_batch);
@@ -217,7 +219,7 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                 if (debug)
                     std::cout << "[App]   STFT batch " << (batch_idx+1) << "/" << num_batches_chunk
                               << ": " << frames_this_batch << " frames"
-                              << " in=0x" << std::hex << dma_buf1->phys_addr
+                              << " in=0x" << std::hex << dma_work_a->phys_addr
                               << " out=0x" << (stft_out_base + spectral_offset) << std::dec << std::endl;
 
                 auto r = dsp_client.process("C7X_MSG_STFT_ANALYZE", params);
@@ -230,12 +232,12 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
 
             // Phase 2: Deinterleave
             if (debug)
-                std::cout << "[App]   Deinterleave: 0x" << std::hex << dma_buf2->phys_addr
-                          << " -> 0x" << dma_buf5->phys_addr << std::dec << std::endl;
+                std::cout << "[App]   Deinterleave: 0x" << std::hex << dma_work_b->phys_addr
+                          << " -> 0x" << dma_work_a->phys_addr << std::dec << std::endl;
             {
                 auto params = deint_stage_ptr->parameters;
-                params["input_buffer"]  = hex_address(dma_buf2->phys_addr);
-                params["output_buffer"] = hex_address(dma_buf5->phys_addr);
+                params["input_buffer"]  = hex_address(dma_work_b->phys_addr);
+                params["output_buffer"] = hex_address(dma_work_a->phys_addr);
                 params["input_frame"]   = std::to_string(TOTAL_FRAMES);
                 auto r = dsp_client.process("C7X_DEINTERLEAVE_MSG_ANALYZE", params);
                 if (!r.success)
@@ -246,39 +248,39 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
             double t_tvm_ms = 0.0;
             auto t_tvm_start = std::chrono::steady_clock::now();
 
-            deint_output_data.resize(spectral_stft_bytes / sizeof(float));
-            inter_input_data.resize(spectral_istft_bytes / sizeof(float));
-
-            dma_buf5.begin_cpu_access();
-            std::copy_n(dma_buf5.data<float>(), deint_output_data.size(),
-                        deint_output_data.begin());
-            dma_buf5.end_cpu_access();
-
             if (tvm_client.is_initialized()) {
-                if (!tvm_client.run_inference(deint_output_data, inter_input_data, tvm_input_shape))
+                // CPU reads the planar DSP output and writes the model result
+                // directly through A's mapping. Keep CPU ownership across the
+                // synchronous call, including socket I/O when using the daemon.
+                dma_work_a.begin_cpu_access();
+                bool inference_ok;
+                try {
+                    inference_ok = tvm_client.run_inference(
+                        dma_work_a.data<float>(), spectral_stft_bytes / sizeof(float),
+                        dma_work_a.data<float>(), spectral_istft_bytes / sizeof(float),
+                        tvm_input_shape);
+                } catch (...) {
+                    dma_work_a.end_cpu_access();
+                    throw;
+                }
+                dma_work_a.end_cpu_access();
+                if (!inference_ok)
                     throw PipelineError{"TVM inference failed"};
                 t_tvm_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - t_tvm_start).count() / 1000.0;
-            } else {
-                inter_input_data = deint_output_data;
+            } else if (spectral_stft_bytes != spectral_istft_bytes) {
+                throw PipelineError{"Bypass output size does not match ISTFT spectral buffer"};
             }
-
-            if (inter_input_data.size() != spectral_istft_bytes / sizeof(float))
-                throw PipelineError{"TVM output size does not match ISTFT spectral buffer"};
+            // With inference disabled, A already holds the planar bypass data.
 
             // Phase 4: Interleave
-            dma_buf6.begin_cpu_access();
-            std::copy(inter_input_data.begin(), inter_input_data.end(),
-                      dma_buf6.data<float>());
-            dma_buf6.end_cpu_access();
-
             if (debug)
-                std::cout << "[App]   Interleave: 0x" << std::hex << dma_buf6->phys_addr
-                          << " -> 0x" << dma_buf3->phys_addr << std::dec << std::endl;
+                std::cout << "[App]   Interleave: 0x" << std::hex << dma_work_a->phys_addr
+                          << " -> 0x" << dma_work_b->phys_addr << std::dec << std::endl;
             {
                 auto params = inter_stage_ptr->parameters;
-                params["input_buffer"]  = hex_address(dma_buf6->phys_addr);
-                params["output_buffer"] = hex_address(dma_buf3->phys_addr);
+                params["input_buffer"]  = hex_address(dma_work_a->phys_addr);
+                params["output_buffer"] = hex_address(dma_work_b->phys_addr);
                 params["input_frame"]   = std::to_string(TOTAL_FRAMES);
                 auto r = dsp_client.process("C7X_DEINTERLEAVE_MSG_ANALYZE", params);
                 if (!r.success)
@@ -286,21 +288,20 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
             }
 
             // Phase 5: ISTFT — collect full chunk output into temporary buffer
-            const size_t ISTFT_PAD_FRAMES  = ISTFT_TOTAL_FRAMES % ISTFT_BATCH_N;
             const size_t ISTFT_NUM_BATCHES = (ISTFT_TOTAL_FRAMES + ISTFT_BATCH_N - 1) / ISTFT_BATCH_N;
             std::vector<int16_t> chunk_output;
             chunk_output.reserve(CHUNK_SAMPLES);
 
             auto t_istft_start = std::chrono::steady_clock::now();
             for (size_t batch_idx = 0; batch_idx < ISTFT_NUM_BATCHES; batch_idx++) {
-                const size_t frames_this_batch  = (batch_idx < ISTFT_NUM_BATCHES - 1) ? ISTFT_BATCH_N : ISTFT_PAD_FRAMES;
+                const size_t frames_this_batch  = std::min(ISTFT_BATCH_N, ISTFT_TOTAL_FRAMES - batch_idx * ISTFT_BATCH_N);
                 const size_t samples_this_batch = frames_this_batch * ISTFT_HOP_SIZE;
                 const size_t audio_offset       = chunk_sample_offset + batch_idx * ISTFT_BATCH_N * ISTFT_HOP_SIZE;
                 const uint64_t spectral_offset  = batch_idx * ISTFT_BATCH_N * ISTFT_MODEL_ELEMS * sizeof(float);
 
                 auto params = istft_stage_ptr->parameters;
                 params["input_buffer"]  = hex_address(istft_src_base + spectral_offset);
-                params["output_buffer"] = hex_address(dma_buf4->phys_addr);
+                params["output_buffer"] = hex_address(dma_work_a->phys_addr);
                 params["input_frame"]   = std::to_string(frames_this_batch);
                 params["output_frame"]  = std::to_string(frames_this_batch);
 
@@ -308,15 +309,15 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                     std::cout << "[App]   ISTFT batch " << (batch_idx+1) << "/" << ISTFT_NUM_BATCHES
                               << ": " << frames_this_batch << " frames"
                               << " in=0x" << std::hex << (istft_src_base + spectral_offset)
-                              << " out=0x" << dma_buf4->phys_addr << std::dec << std::endl;
+                              << " out=0x" << dma_work_a->phys_addr << std::dec << std::endl;
 
                 auto r = dsp_client.process("C7X_MSG_ISTFT_SYNTHESIZE", params);
                 if (!r.success)
                     throw PipelineError{"ISTFT batch " + std::to_string(batch_idx + 1) +
                                         " failed: " + r.error_message};
 
-                dma_buf4.begin_cpu_access();
-                const auto* out_ptr = dma_buf4.data<int16_t>();
+                dma_work_a.begin_cpu_access();
+                const auto* out_ptr = dma_work_a.data<int16_t>();
 
                 if (debug) {
                     std::cout << "[App]   Frame | InRMS  OutRMS | In[0..4]              | Out[0..4]" << std::endl;
@@ -346,8 +347,7 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                 }
 
                 std::copy_n(out_ptr, samples_this_batch, std::back_inserter(chunk_output));
-                audio_stream.send_frame(1, out_ptr, samples_this_batch * sizeof(int16_t));
-                dma_buf4.end_cpu_access();
+                dma_work_a.end_cpu_access();
             }
             double t_istft_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t_istft_start).count() / 1000.0;
@@ -358,6 +358,15 @@ PipelineManager::CommandResult run_speech_enhancement_pipeline(
                 std::copy(chunk_output.begin() + static_cast<std::ptrdiff_t>(lo_sample),
                           chunk_output.begin() + static_cast<std::ptrdiff_t>(keep_end),
                           std::back_inserter(processed_audio_data));
+                // Publish only finalized samples, identical to the saved WAV. Pair
+                // input/output on the same source timeline and bound message size.
+                for (size_t offset = lo_sample; offset < keep_end; offset += 1024) {
+                    const size_t count = std::min(size_t{1024}, keep_end - offset);
+                    audio_stream.send_frame(0, audio_data.data() + chunk_sample_offset + offset,
+                                            count * sizeof(int16_t));
+                    audio_stream.send_frame(1, chunk_output.data() + offset,
+                                            count * sizeof(int16_t));
+                }
             }
 
             double t_chunk_ms = std::chrono::duration_cast<std::chrono::microseconds>(

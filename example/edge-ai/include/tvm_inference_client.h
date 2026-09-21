@@ -45,6 +45,12 @@ public:
                        std::vector<float>& output,
                        const std::vector<int64_t>& shape);
 
+    // Synchronous caller-owned buffers. Input/output may alias: input is fully
+    // consumed before output is written. output_count is the exact expected size.
+    bool run_inference(const float* input, size_t input_count,
+                       float* output, size_t output_count,
+                       const std::vector<int64_t>& shape);
+
     // Status
     bool is_initialized() const { return initialized_; }
 
@@ -66,7 +72,12 @@ private:
 
     // Daemon client helpers
     bool try_daemon_connect();
-    bool run_via_daemon(const float* input, size_t count, std::vector<float>& output);
+    bool run_via_daemon(const float* input, size_t count, std::vector<float>& output,
+                        float* destination = nullptr, size_t output_count = 0);
+    bool run_inference_impl(const float* input, size_t input_count,
+                            std::vector<float>& output,
+                            const std::vector<int64_t>& shape,
+                            float* destination = nullptr, size_t output_count = 0);
 };
 
 #endif // TVM_INFERENCE_CLIENT_H

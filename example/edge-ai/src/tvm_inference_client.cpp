@@ -187,7 +187,11 @@ bool TvmInferenceClient::switch_model(const std::string& artifacts_path) {
     return success;
 }
 
-bool TvmInferenceClient::run_via_daemon(const float* input, size_t count, std::vector<float>& output) {
+bool TvmInferenceClient::run_via_daemon(const float* input, size_t count,
+                                          std::vector<float>& output,
+                                          float* destination, size_t output_count) {
+    if (count > std::numeric_limits<uint32_t>::max() / sizeof(float))
+        return false;
     const uint32_t in_bytes = static_cast<uint32_t>(count * sizeof(float));
     TvmDaemon::Header req{TvmDaemon::MAGIC,
                           static_cast<uint32_t>(TvmDaemon::MsgType::INFER_REQ),
@@ -219,8 +223,18 @@ bool TvmInferenceClient::run_via_daemon(const float* input, size_t count, std::v
     }
 
     const size_t out_floats = resp.len / sizeof(float);
-    output.resize(out_floats);
-    if (!sock_read_all(daemon_fd_, output.data(), resp.len)) {
+    if (resp.len % sizeof(float) != 0 ||
+        (destination && out_floats != output_count)) {
+        std::cerr << "[TVM] Daemon output size does not match destination\n";
+        // An unread payload would corrupt the next exchange; discard connection.
+        cleanup();
+        return false;
+    }
+    if (!destination) {
+        output.resize(out_floats);
+        destination = output.data();
+    }
+    if (!sock_read_all(daemon_fd_, destination, resp.len)) {
         std::cerr << "[TVM] Daemon: failed to read output\n";
         return false;
     }
@@ -329,17 +343,33 @@ bool TvmInferenceClient::load_artifacts() {
 bool TvmInferenceClient::run_inference(const std::vector<float>& input_data,
                                        std::vector<float>& output_data,
                                        const std::vector<int64_t>& input_shape) {
+    return run_inference_impl(input_data.data(), input_data.size(), output_data,
+                              input_shape);
+}
+
+bool TvmInferenceClient::run_inference(const float* input, size_t input_count,
+                                       float* output, size_t output_count,
+                                       const std::vector<int64_t>& shape) {
+    if (!output || output_count == 0 ||
+        output_count > std::numeric_limits<size_t>::max() / sizeof(float))
+        return false;
+    std::vector<float> unused_output; // No allocation in the caller-owned path.
+    return run_inference_impl(input, input_count, unused_output, shape,
+                              output, output_count);
+}
+
+bool TvmInferenceClient::run_inference_impl(const float* input, size_t input_count,
+                                            std::vector<float>& output_data,
+                                            const std::vector<int64_t>& input_shape,
+                                            float* destination, size_t output_count) {
     if (!initialized_) {
         std::cerr << "[TVM] Not initialized" << std::endl;
         return false;
     }
-    if (input_data.empty() || input_shape.empty()) {
+    if (!input || input_count == 0 || input_shape.empty() ||
+        input_count > std::numeric_limits<size_t>::max() / sizeof(float)) {
         std::cerr << "[TVM] Input data size or shape is invalid" << std::endl;
         return false;
-    }
-
-    if (daemon_fd_ >= 0) {
-        return run_via_daemon(input_data.data(), input_data.size(), output_data);
     }
 
     try {
@@ -351,20 +381,28 @@ bool TvmInferenceClient::run_inference(const std::vector<float>& input_data,
                     throw std::overflow_error{"Invalid TVM input shape"};
                 return total * static_cast<size_t>(extent);
             });
-        if (shape_elements != input_data.size())
+        if (shape_elements != input_count)
             throw std::runtime_error{"TVM input shape does not match the input data"};
+
+        if (daemon_fd_ >= 0)
+            return run_via_daemon(input, input_count, output_data, destination, output_count);
 
         const auto start = std::chrono::steady_clock::now();
 
         NDArray input_array = NDArray::Empty(input_shape, DLDataType{kDLFloat, 32, 1}, {kDLCPU, 0});
-        input_array.CopyFromBytes(input_data.data(), input_data.size() * sizeof(float));
+        input_array.CopyFromBytes(input, input_count * sizeof(float));
         (*set_input_)(0, input_array);
         (*run_)();
 
         NDArray out = (*get_output_)(0);
         const size_t output_elements = tensor_element_count(out.operator->());
-        output_data.resize(output_elements);
-        out.CopyToBytes(output_data.data(), output_elements * sizeof(float));
+        if (destination && output_elements != output_count)
+            throw std::runtime_error{"TVM output size does not match destination"};
+        if (!destination) {
+            output_data.resize(output_elements);
+            destination = output_data.data();
+        }
+        out.CopyToBytes(destination, output_elements * sizeof(float));
 
         const auto end = std::chrono::steady_clock::now();
         double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
